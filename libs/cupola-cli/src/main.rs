@@ -46,6 +46,13 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+
+    /// Compute BLAKE3 of a single file (v0 utility).
+    Blake3 {
+        /// Path to a file to hash.
+        #[arg(long)]
+        file: PathBuf,
+    },
 }
 
 async fn ensure_vault(db: &DbPool, vault_root: &std::path::Path) -> anyhow::Result<VaultId> {
@@ -119,6 +126,25 @@ async fn main() -> Result<()> {
             let n = pipe.run_hash_all().await?;
 
             println!("OK: hashed {} files", n);
+        }
+        Command::Blake3 { file } => {
+            use std::io::Read;
+
+            let path = file.canonicalize()?;
+            let mut f = std::fs::File::open(&path)?;
+            let mut h = blake3::Hasher::new();
+            let mut buf = vec![0u8; 1024 * 1024];
+
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+            }
+
+            let hex = h.finalize().to_hex().to_string();
+            println!("BLAKE3 {} {}", hex, path.display());
         }
         Command::Status { vault, json } => {
             let vault_root = vault.canonicalize()?;
