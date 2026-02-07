@@ -66,7 +66,17 @@ pub fn now_ns() -> i64 {
 pub struct VaultManager {
     app_root: PathBuf,
 }
+fn derive_vault_id(root_path: &str) -> VaultId {
+    // Normalize for stability across runs (Windows-safe).
+    // - remove \\?\ prefix if present
+    // - lowercase
+    // - unify separators to '/'
+    let s = root_path.trim();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(s);
+    let s = s.replace('\\', "/").to_lowercase();
 
+    VaultId(Uuid::new_v5(&Uuid::NAMESPACE_URL, s.as_bytes()))
+}
 impl VaultManager {
     pub fn new(app_root: PathBuf) -> Self {
         Self { app_root }
@@ -85,7 +95,7 @@ impl VaultManager {
     }
 
     pub async fn create_vault(&self, name: &str, root_path: &str) -> Result<Vault> {
-        let id = VaultId(Uuid::new_v4());
+        let id = derive_vault_id(root_path);
         self.ensure_layout(&id).await?;
         Ok(Vault {
             id,
@@ -106,10 +116,20 @@ mod tests {
     async fn vault_layout_is_created() {
         let td = TempDir::new().unwrap();
         let mgr = VaultManager::new(td.path().to_path_buf());
-        let v = mgr.create_vault("Test", "C:\\tmp").await.unwrap();
+        let v = mgr.create_vault("Test", r"C:\tmp").await.unwrap();
 
         let vdir = vault_dir(mgr.app_root(), &v.id);
         assert!(vdir.join("cas").exists());
         assert!(vdir.join("indexes").exists());
+    }
+    #[tokio::test]
+    async fn vault_id_is_deterministic_from_root_path() {
+        let td = TempDir::new().unwrap();
+        let mgr = VaultManager::new(td.path().to_path_buf());
+
+        let v1 = mgr.create_vault("A", r"\\?\C:\TMP\Vault").await.unwrap();
+        let v2 = mgr.create_vault("B", r"c:/tmp/vault").await.unwrap();
+
+        assert_eq!(v1.id.0, v2.id.0);
     }
 }
