@@ -1,0 +1,72 @@
+mod migrations;
+
+use anyhow::Result;
+use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use std::path::Path;
+
+pub struct DbPool(SqlitePool);
+
+impl DbPool {
+    pub async fn new(path: &Path) -> Result<Self> {
+        // sqlx wants forward slashes in sqlite URLs, even on Windows.
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        // sqlx sqlite URL for absolute Windows paths must be: sqlite:///E:/.../db.sqlite
+        let url = format!(
+            "sqlite:///{}",
+            path.display().to_string().replace('\\', "/")
+        );
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await?;
+
+        let db = Self(pool);
+        db.pragmas().await?;
+        migrations::run(db.pool()).await?;
+        Ok(db)
+    }
+
+    pub async fn pragmas(&self) -> Result<()> {
+        // v0 defaults (match spec)
+        sqlx::query("PRAGMA journal_mode = WAL;")
+            .execute(&self.0)
+            .await?;
+        sqlx::query("PRAGMA synchronous = NORMAL;")
+            .execute(&self.0)
+            .await?;
+        sqlx::query("PRAGMA temp_store = MEMORY;")
+            .execute(&self.0)
+            .await?;
+        sqlx::query("PRAGMA foreign_keys = ON;")
+            .execute(&self.0)
+            .await?;
+        sqlx::query("PRAGMA busy_timeout = 5000;")
+            .execute(&self.0)
+            .await?;
+        Ok(())
+    }
+
+    pub fn pool(&self) -> &SqlitePool {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn ping_works() {
+        let td = TempDir::new().unwrap();
+        let db_path = td.path().join("db.sqlite");
+        let db = DbPool::new(&db_path).await.unwrap();
+        let (one,): (i64,) = sqlx::query_as("SELECT 1;")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(one, 1);
+    }
+}

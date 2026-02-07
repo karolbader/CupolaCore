@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+  "libs/cupola-db",
+  "libs/cupola-core",
+  "libs/cupola-indexer",
+  "libs/cupola-protocol"
+, "libs/cupola-cli"]
+
+[workspace.package]
+edition = "2021"

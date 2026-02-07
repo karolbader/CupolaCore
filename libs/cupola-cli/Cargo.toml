@@ -1,0 +1,19 @@
+[package]
+name = "cupola-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+blake3 = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+cupola-core = { path = "../cupola-core" }
+cupola-db = { path = "../cupola-db" }
+cupola-cas = { path = "../cupola-cas" }
+cupola-indexer = { path = "../cupola-indexer" }
+
+

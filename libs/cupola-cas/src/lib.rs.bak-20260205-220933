@@ -1,0 +1,109 @@
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlobId(String);
+
+impl BlobId {
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+#[derive(Debug, Clone)]
+pub struct CasStore {
+    root: PathBuf,
+}
+
+impl CasStore {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    /// Returns the sharded file path for a given hex hash:
+    /// {root}\ab\cd\{hash}.blob
+    pub fn shard_path(&self, hash: &str) -> PathBuf {
+        let a = &hash[0..2];
+        let b = &hash[2..4];
+        self.root.join(a).join(b).join(format!("{hash}.blob"))
+    }
+
+    pub async fn put(&self, data: &[u8]) -> std::io::Result<BlobId> {
+        let hash = blake3::hash(data).to_hex().to_string();
+        let final_path = self.shard_path(&hash);
+
+        // Ensure parent dir exists
+        if let Some(parent) = final_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        // Dedupe: if already exists, return
+        if tokio::fs::try_exists(&final_path).await? {
+            return Ok(BlobId(hash));
+        }
+
+        // Atomic-ish write: temp file in same dir then rename
+        let tmp_path = final_path.with_extension("tmp");
+        tokio::fs::write(&tmp_path, data).await?;
+
+        // If a race happened and final exists now, prefer final and remove tmp
+        if tokio::fs::try_exists(&final_path).await? {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Ok(BlobId(hash));
+        }
+
+        tokio::fs::rename(&tmp_path, &final_path).await?;
+        Ok(BlobId(hash))
+    }
+
+    pub async fn get(&self, id: &BlobId) -> std::io::Result<Vec<u8>> {
+        let p = self.shard_path(id.as_str());
+        tokio::fs::read(p).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn put_is_deduped() {
+        let td = TempDir::new().unwrap();
+        let cas = CasStore::new(td.path().to_path_buf());
+
+        let a = cas.put(b"hello").await.unwrap();
+        let b = cas.put(b"hello").await.unwrap();
+        assert_eq!(a, b);
+
+        let p = cas.shard_path(a.as_str());
+        assert!(p.exists(), "final blob path should exist");
+    }
+
+    #[tokio::test]
+    async fn roundtrip_get_matches_put() {
+        let td = TempDir::new().unwrap();
+        let cas = CasStore::new(td.path().to_path_buf());
+
+        let id = cas.put(b"abc123").await.unwrap();
+        let bytes = cas.get(&id).await.unwrap();
+        assert_eq!(bytes, b"abc123");
+    }
+
+    #[tokio::test]
+    async fn shard_layout_matches_ab_cd_hash_blob() {
+        let td = TempDir::new().unwrap();
+        let cas = CasStore::new(td.path().to_path_buf());
+
+        let id = cas.put(b"layout-test").await.unwrap();
+        let h = id.as_str();
+        assert!(h.len() >= 4);
+
+        let p = cas.shard_path(h);
+        let s = p.to_string_lossy().to_string();
+
+        $expectedA = h.Substring(0,2)
+        $expectedB = h.Substring(2,2)
+
+        # We can only assert the substrings exist (path separators differ by OS)
+        assert!(s.contains(&format!("{}{}{}", $expectedA, std::path::MAIN_SEPARATOR, $expectedB)));
+        assert!(s.ends_with(&format!("{}.blob", h)));
+    }
+}

@@ -1,0 +1,81 @@
+use anyhow::Result;
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    SqlitePool,
+};
+use std::path::Path;
+
+mod migrations;
+
+pub struct DbPool(SqlitePool);
+
+impl DbPool {
+    pub async fn new(db_path: &Path) -> Result<Self> {
+        if let Some(parent) = db_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let opts = SqliteConnectOptions::new()
+            .filename(db_path)
+            .create_if_missing(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(opts)
+            .await?;
+
+        Self::pragmas_on(&pool).await?;
+        migrations::run(&pool).await?;
+
+        Ok(Self(pool))
+    }
+
+    pub fn pool(&self) -> &SqlitePool {
+        &self.0
+    }
+
+    async fn pragmas_on(pool: &SqlitePool) -> Result<()> {
+        // IMPORTANT: pragmas must NOT be inside sqlx migrations transaction.
+        // So we run them here, after connect, before/after migrations.
+        sqlx::query("PRAGMA journal_mode=WAL;")
+            .execute(pool)
+            .await?;
+        sqlx::query("PRAGMA synchronous=NORMAL;")
+            .execute(pool)
+            .await?;
+        sqlx::query("PRAGMA temp_store=MEMORY;")
+            .execute(pool)
+            .await?;
+        sqlx::query("PRAGMA foreign_keys=ON;").execute(pool).await?;
+        sqlx::query("PRAGMA busy_timeout=5000;")
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Handy for tests that don't need a file on disk.
+    pub async fn new_memory() -> Result<Self> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+        Self::pragmas_on(&pool).await?;
+        migrations::run(&pool).await?;
+        Ok(Self(pool))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ping_works() {
+        let db = DbPool::new_memory().await.unwrap();
+        let row: (i64,) = sqlx::query_as("SELECT 1;")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(row.0, 1);
+    }
+}

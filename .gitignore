@@ -1,0 +1,42 @@
+# Rust
+/target/
+/**/target/
+
+# Node / UI (future)
+/node_modules/
+/**/node_modules/
+/dist/
+/**/dist/
+
+# Tauri build outputs (future)
+/apps/**/src-tauri/target/
+/apps/**/src-tauri/gen/
+/apps/**/.tauri/
+
+# Local data / artifacts
+/.freeze/
+/**/.freeze/
+*.zip
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/# Rust / Cargo
+/target/
+/**/target/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Cupola local artifacts
+/.audit/
+/logs/
+/.freeze/
+/_vault*/
