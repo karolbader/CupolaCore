@@ -108,9 +108,13 @@ impl HashStage {
         if let Some(row) = latest {
             let last_id: String = row.try_get("id")?;
             let last_blob: String = row.try_get("raw_blob_id")?;
+            let last_mtime: i64 = row.try_get("mtime_ns")?;
             let last_size: i64 = row.try_get("file_size")?;
 
-            if last_blob == raw_blob_id.as_str() && last_size == file_size as i64 {
+            if last_blob == raw_blob_id.as_str()
+                && last_mtime == mtime_ns
+                && last_size == file_size as i64
+            {
                 return Ok(HashOutput {
                     artifact_id,
                     artifact_version_id: last_id,
