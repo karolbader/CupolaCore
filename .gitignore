@@ -40,3 +40,5 @@ Thumbs.db
 /logs/
 /.freeze/
 /_vault*/
+# Editor/patch backups
+*.bak-*
