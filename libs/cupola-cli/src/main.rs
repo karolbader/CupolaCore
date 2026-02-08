@@ -246,7 +246,16 @@ async fn main() -> Result<()> {
 
             let rows = sqlx::query(
                 r#"
-                SELECT a.rel_path as rel_path, c.excerpt as excerpt
+                SELECT
+                    a.rel_path as rel_path,
+                    c.excerpt as excerpt,
+                    c.id as chunk_id,
+                    av.raw_blob_id as raw_blob_id,
+                    c.chunk_blob_id as chunk_blob_id,
+                    av.mtime_ns as mtime_ns,
+                    av.file_type as file_type,
+                    c.start_line as start_line,
+                    c.end_line as end_line
                 FROM chunks c
                 JOIN artifact_versions av ON av.id = c.artifact_version_id
                 JOIN artifacts a ON a.id = av.artifact_id
@@ -262,9 +271,30 @@ async fn main() -> Result<()> {
             .await?;
 
             for r in rows {
-                let p: String = r.try_get("rel_path")?;
-                let ex: String = r.try_get("excerpt")?;
-                println!("{} :: {}", p, ex.replace('\n', " "));
+                let rel_path: String = r.try_get("rel_path")?;
+                let excerpt: String = r.try_get("excerpt")?;
+                let chunk_id: String = r.try_get("chunk_id")?;
+                let raw_blob_id: String = r.try_get("raw_blob_id")?;
+                let chunk_blob_id: String = r.try_get("chunk_blob_id")?;
+                let mtime_ns: i64 = r.try_get("mtime_ns")?;
+                let file_type: Option<String> = r.try_get("file_type")?;
+                let start_line: Option<i64> = r.try_get("start_line")?;
+                let end_line: Option<i64> = r.try_get("end_line")?;
+                let mut line_info = String::new();
+                if let (Some(start), Some(end)) = (start_line, end_line) {
+                    line_info = format!("{}-{}", start, end);
+                }
+                println!(
+                    "{} | {} | [{}] | {} | {} | {} | {} | {}",
+                    chunk_id,
+                    rel_path,
+                    file_type.as_deref().unwrap_or("unknown"),
+                    mtime_ns,
+                    raw_blob_id,
+                    chunk_blob_id,
+                    line_info,
+                    excerpt.replace('\n', " "),
+                );
             }
         }
     }
