@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand};
 use cupola_cas::CasStore;
 use cupola_core::{app_data_root, now_ns, vault_indexes_root, VaultId};
 use cupola_db::DbPool;
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "cupola", version, about = "Cupola CLI (v0)")]
@@ -45,6 +47,26 @@ enum Command {
         /// Max results.
         #[arg(long, default_value_t = 20)]
         limit: u32,
+    },
+
+    /// Freeze current vault content into a manifest JSON.
+    Freeze {
+        /// Absolute or relative path to the vault root folder.
+        #[arg(long)]
+        vault: PathBuf,
+        /// Output path for manifest JSON.
+        #[arg(long)]
+        out: PathBuf,
+    },
+
+    /// Verify vault content against a manifest JSON.
+    Verify {
+        /// Absolute or relative path to the vault root folder.
+        #[arg(long)]
+        vault: PathBuf,
+        /// Input manifest JSON path.
+        #[arg(long)]
+        manifest: PathBuf,
     },
 
     /// Compute BLAKE3 of a single file (v0 utility).
@@ -128,6 +150,156 @@ fn print_search_row(r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ManifestV0 {
+    vault_id: String,
+    root: String,
+    created_at: i64,
+    artifacts: Vec<ManifestArtifactV0>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ManifestArtifactV0 {
+    rel_path: String,
+    raw_blob_id: String,
+    mtime_ns: i64,
+    file_size: i64,
+    file_type: String,
+    artifact_version_id: String,
+}
+
+async fn freeze_vault_with_app_root(vault: PathBuf, out: PathBuf, app_root: PathBuf) -> Result<()> {
+    let vault_root = vault.canonicalize()?;
+    let db_path = app_root.join("db.sqlite");
+    let db = DbPool::new(&db_path).await?;
+
+    let vault_id = ensure_vault(&db, &vault_root).await?;
+    let vdir = app_root.join("vaults").join(vault_id.0.to_string());
+    let cas_root = vdir.join("cas");
+    tokio::fs::create_dir_all(&cas_root).await?;
+    let cas = CasStore::new(cas_root);
+
+    let items = cupola_indexer::crawl_sorted(&vault_root)?;
+    let mut artifacts = Vec::with_capacity(items.len());
+
+    for it in items {
+        let out = cupola_indexer::stages::hash::HashStage::run(
+            &db,
+            &cas,
+            &vault_id,
+            &vault_root,
+            &it.abs_path,
+        )
+        .await?;
+        artifacts.push(ManifestArtifactV0 {
+            rel_path: it.rel_path,
+            raw_blob_id: out.raw_blob_id.as_str().to_string(),
+            mtime_ns: out.mtime_ns,
+            file_size: out.file_size as i64,
+            file_type: out.file_type,
+            artifact_version_id: out.artifact_version_id,
+        });
+    }
+
+    artifacts.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+    let manifest = ManifestV0 {
+        vault_id: vault_id.0.to_string(),
+        root: vault_root.to_string_lossy().to_string(),
+        created_at: now_ns(),
+        artifacts,
+    };
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    if let Some(parent) = out.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&out, &manifest_bytes).await?;
+
+    let manifest_blob_id = cas.put(&manifest_bytes).await?;
+    sqlx::query("INSERT OR IGNORE INTO blobs (hash, size, cas_key) VALUES (?1, ?2, ?3)")
+        .bind(manifest_blob_id.as_str())
+        .bind(manifest_bytes.len() as i64)
+        .bind(manifest_blob_id.as_str())
+        .execute(db.pool())
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO freezes (id, vault_id, created_at, manifest_blob_id) VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(vault_id.0.to_string())
+    .bind(manifest.created_at)
+    .bind(manifest_blob_id.as_str())
+    .execute(db.pool())
+    .await?;
+
+    println!(
+        "OK: froze {} artifacts -> {}",
+        manifest.artifacts.len(),
+        out.display()
+    );
+    Ok(())
+}
+
+async fn verify_vault_with_app_root(
+    vault: PathBuf,
+    manifest_path: PathBuf,
+    app_root: PathBuf,
+) -> Result<()> {
+    let vault_root = vault.canonicalize()?;
+    let manifest_bytes = tokio::fs::read(&manifest_path).await?;
+    let manifest: ManifestV0 = serde_json::from_slice(&manifest_bytes)?;
+
+    let db_path = app_root.join("db.sqlite");
+    let db = DbPool::new(&db_path).await?;
+    let vault_id = ensure_vault(&db, &vault_root).await?;
+    if manifest.vault_id != vault_id.0.to_string() {
+        anyhow::bail!(
+            "manifest vault_id mismatch: expected {}, got {}",
+            vault_id.0,
+            manifest.vault_id
+        );
+    }
+
+    let mut current_hashes: BTreeMap<String, String> = BTreeMap::new();
+    for it in cupola_indexer::crawl_sorted(&vault_root)? {
+        let bytes = tokio::fs::read(&it.abs_path).await?;
+        let raw_blob_id = blake3::hash(&bytes).to_hex().to_string();
+        current_hashes.insert(it.rel_path, raw_blob_id);
+    }
+
+    let mut mismatches: Vec<String> = Vec::new();
+    let mut manifest_paths: BTreeSet<String> = BTreeSet::new();
+    for a in &manifest.artifacts {
+        manifest_paths.insert(a.rel_path.clone());
+        match current_hashes.get(&a.rel_path) {
+            Some(raw_blob_id) if raw_blob_id == &a.raw_blob_id => {}
+            Some(raw_blob_id) => mismatches.push(format!(
+                "MODIFIED {} expected={} actual={}",
+                a.rel_path, a.raw_blob_id, raw_blob_id
+            )),
+            None => mismatches.push(format!("MISSING {}", a.rel_path)),
+        }
+    }
+
+    for rel_path in current_hashes.keys() {
+        if !manifest_paths.contains(rel_path) {
+            mismatches.push(format!("EXTRA {}", rel_path));
+        }
+    }
+
+    if mismatches.is_empty() {
+        println!("OK: verify passed ({} artifacts)", manifest.artifacts.len());
+        return Ok(());
+    }
+
+    for m in &mismatches {
+        println!("ERR: {}", m);
+    }
+    anyhow::bail!("verify failed: {} mismatch(es)", mismatches.len());
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -344,7 +516,55 @@ async fn main() -> Result<()> {
                 print_search_row(&r)?;
             }
         }
+        Command::Freeze { vault, out } => {
+            let app_root = app_data_root()?;
+            freeze_vault_with_app_root(vault, out, app_root).await?;
+        }
+        Command::Verify { vault, manifest } => {
+            let app_root = app_data_root()?;
+            verify_vault_with_app_root(vault, manifest, app_root).await?;
+        }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn freeze_then_verify_passes_then_fails_after_modification() -> Result<()> {
+        let vault = TempDir::new()?;
+        let mut f = std::fs::File::create(vault.path().join("a.txt"))?;
+        writeln!(f, "hello cupola")?;
+
+        let app = TempDir::new()?;
+        let app_root = app.path().join("Cupola");
+        let manifest_path = app.path().join("manifest.json");
+
+        freeze_vault_with_app_root(
+            vault.path().to_path_buf(),
+            manifest_path.clone(),
+            app_root.clone(),
+        )
+        .await?;
+        verify_vault_with_app_root(
+            vault.path().to_path_buf(),
+            manifest_path.clone(),
+            app_root.clone(),
+        )
+        .await?;
+
+        std::fs::write(vault.path().join("a.txt"), "changed content")?;
+
+        let err = verify_vault_with_app_root(vault.path().to_path_buf(), manifest_path, app_root)
+            .await
+            .expect_err("verify should fail after file modification");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("verify failed"));
+        Ok(())
+    }
 }

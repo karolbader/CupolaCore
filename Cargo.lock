@@ -395,7 +395,10 @@ dependencies = [
  "cupola-db",
  "cupola-indexer",
  "cupola-search",
+ "serde",
+ "serde_json",
  "sqlx",
+ "tempfile",
  "tokio",
  "uuid",
 ]
