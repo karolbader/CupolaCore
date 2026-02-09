@@ -394,6 +394,7 @@ dependencies = [
  "cupola-core",
  "cupola-db",
  "cupola-indexer",
+ "cupola-protocol",
  "cupola-search",
  "serde",
  "serde_json",
@@ -408,10 +409,12 @@ name = "cupola-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "cupola-cas",
  "cupola-db",
  "cupola-protocol",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "uuid",
@@ -456,14 +459,10 @@ dependencies = [
 name = "cupola-search"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "cupola-cas",
- "cupola-db",
- "sqlx",
+ "serde",
  "tantivy",
  "tempfile",
- "tokio",
- "uuid",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

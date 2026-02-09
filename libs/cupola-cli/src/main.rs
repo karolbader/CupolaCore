@@ -1,11 +1,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use cupola_cas::CasStore;
-use cupola_core::{app_data_root, now_ns, vault_indexes_root, VaultId};
+use cupola_core::{
+    app_data_root, now_ns, vault_indexes_root, ManifestArtifactV0, ManifestV0, VaultId,
+    VerifyDiffKind,
+};
 use cupola_db::DbPool;
-use serde::{Deserialize, Serialize};
+use cupola_protocol::{SearchHitDTO, SearchResponseDTO};
 use sqlx::Row;
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "cupola", version, about = "Cupola CLI (v0)")]
@@ -47,6 +49,10 @@ enum Command {
         /// Max results.
         #[arg(long, default_value_t = 20)]
         limit: u32,
+
+        /// Emit JSON (machine-readable).
+        #[arg(long)]
+        json: bool,
     },
 
     /// Freeze current vault content into a manifest JSON.
@@ -67,6 +73,10 @@ enum Command {
         /// Input manifest JSON path.
         #[arg(long)]
         manifest: PathBuf,
+
+        /// Emit JSON (machine-readable).
+        #[arg(long)]
+        json: bool,
     },
 
     /// Compute BLAKE3 of a single file (v0 utility).
@@ -123,7 +133,7 @@ async fn ensure_vault(db: &DbPool, vault_root: &std::path::Path) -> anyhow::Resu
     Ok(VaultId(id))
 }
 
-fn print_search_row(r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<()> {
+fn row_to_search_hit(r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<SearchHitDTO> {
     let rel_path: String = r.try_get("rel_path")?;
     let excerpt: String = r.try_get("excerpt")?;
     let chunk_id: String = r.try_get("chunk_id")?;
@@ -133,40 +143,35 @@ fn print_search_row(r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<()> {
     let file_type: Option<String> = r.try_get("file_type")?;
     let start_line: Option<i64> = r.try_get("start_line")?;
     let end_line: Option<i64> = r.try_get("end_line")?;
+    Ok(SearchHitDTO {
+        chunk_id,
+        rel_path,
+        file_type: file_type.unwrap_or_else(|| "unknown".to_string()),
+        mtime_ns,
+        raw_blob_id,
+        chunk_blob_id,
+        start_line,
+        end_line,
+        excerpt: excerpt.replace('\n', " "),
+    })
+}
+
+fn print_search_hit(hit: &SearchHitDTO) {
     let mut line_info = String::new();
-    if let (Some(start), Some(end)) = (start_line, end_line) {
+    if let (Some(start), Some(end)) = (hit.start_line, hit.end_line) {
         line_info = format!("{}-{}", start, end);
     }
     println!(
         "{} | {} | [{}] | {} | {} | {} | {} | {}",
-        chunk_id,
-        rel_path,
-        file_type.as_deref().unwrap_or("unknown"),
-        mtime_ns,
-        raw_blob_id,
-        chunk_blob_id,
+        hit.chunk_id,
+        hit.rel_path,
+        hit.file_type,
+        hit.mtime_ns,
+        hit.raw_blob_id,
+        hit.chunk_blob_id,
         line_info,
-        excerpt.replace('\n', " "),
+        hit.excerpt,
     );
-    Ok(())
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ManifestV0 {
-    vault_id: String,
-    root: String,
-    created_at: i64,
-    artifacts: Vec<ManifestArtifactV0>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ManifestArtifactV0 {
-    rel_path: String,
-    raw_blob_id: String,
-    mtime_ns: i64,
-    file_size: i64,
-    file_type: String,
-    artifact_version_id: String,
 }
 
 async fn freeze_vault_with_app_root(vault: PathBuf, out: PathBuf, app_root: PathBuf) -> Result<()> {
@@ -242,62 +247,90 @@ async fn freeze_vault_with_app_root(vault: PathBuf, out: PathBuf, app_root: Path
     Ok(())
 }
 
+async fn rebuild_search_index_for_vault(
+    db: &DbPool,
+    cas: &CasStore,
+    vault_id: &str,
+    index_dir: &std::path::Path,
+) -> Result<usize> {
+    if index_dir.exists() {
+        let _ = std::fs::remove_dir_all(index_dir);
+    }
+    let si = cupola_search::SearchIndex::new(index_dir)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            c.id as chunk_id,
+            c.chunk_blob_id as chunk_blob_id,
+            c.excerpt as excerpt
+        FROM chunks c
+        JOIN artifact_versions av ON av.id = c.artifact_version_id
+        JOIN artifacts a ON a.id = av.artifact_id
+        WHERE a.vault_id = ?1
+        ORDER BY c.id ASC
+        "#,
+    )
+    .bind(vault_id)
+    .fetch_all(db.pool())
+    .await?;
+
+    for r in &rows {
+        let chunk_id: String = r.try_get("chunk_id")?;
+        let chunk_blob_id: String = r.try_get("chunk_blob_id")?;
+        let excerpt: String = r.try_get("excerpt")?;
+        let content = match cas
+            .get(&cupola_cas::BlobId::from_hash(chunk_blob_id.clone()))
+            .await
+        {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(_) => excerpt,
+        };
+        let _ = si.ingest_document(&chunk_id, &content)?;
+    }
+    Ok(rows.len())
+}
+
 async fn verify_vault_with_app_root(
     vault: PathBuf,
     manifest_path: PathBuf,
-    app_root: PathBuf,
+    _app_root: PathBuf,
+    json: bool,
 ) -> Result<()> {
     let vault_root = vault.canonicalize()?;
-    let manifest_bytes = tokio::fs::read(&manifest_path).await?;
-    let manifest: ManifestV0 = serde_json::from_slice(&manifest_bytes)?;
-
-    let db_path = app_root.join("db.sqlite");
-    let db = DbPool::new(&db_path).await?;
-    let vault_id = ensure_vault(&db, &vault_root).await?;
-    if manifest.vault_id != vault_id.0.to_string() {
-        anyhow::bail!(
-            "manifest vault_id mismatch: expected {}, got {}",
-            vault_id.0,
-            manifest.vault_id
-        );
-    }
-
-    let mut current_hashes: BTreeMap<String, String> = BTreeMap::new();
-    for it in cupola_indexer::crawl_sorted(&vault_root)? {
-        let bytes = tokio::fs::read(&it.abs_path).await?;
-        let raw_blob_id = blake3::hash(&bytes).to_hex().to_string();
-        current_hashes.insert(it.rel_path, raw_blob_id);
-    }
-
-    let mut mismatches: Vec<String> = Vec::new();
-    let mut manifest_paths: BTreeSet<String> = BTreeSet::new();
-    for a in &manifest.artifacts {
-        manifest_paths.insert(a.rel_path.clone());
-        match current_hashes.get(&a.rel_path) {
-            Some(raw_blob_id) if raw_blob_id == &a.raw_blob_id => {}
-            Some(raw_blob_id) => mismatches.push(format!(
-                "MODIFIED {} expected={} actual={}",
-                a.rel_path, a.raw_blob_id, raw_blob_id
-            )),
-            None => mismatches.push(format!("MISSING {}", a.rel_path)),
+    let report = cupola_core::verify_manifest(&vault_root, &manifest_path).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if report.ok {
+            return Ok(());
         }
+        anyhow::bail!("verify failed: {} mismatch(es)", report.mismatches.len());
     }
 
-    for rel_path in current_hashes.keys() {
-        if !manifest_paths.contains(rel_path) {
-            mismatches.push(format!("EXTRA {}", rel_path));
-        }
-    }
-
-    if mismatches.is_empty() {
-        println!("OK: verify passed ({} artifacts)", manifest.artifacts.len());
+    if report.ok {
+        println!("OK: verify passed ({} artifacts)", report.artifact_count);
         return Ok(());
     }
 
-    for m in &mismatches {
-        println!("ERR: {}", m);
+    for m in &report.mismatches {
+        match m.kind {
+            VerifyDiffKind::Modified => {
+                let expected = m.expected_raw_blob_id.as_deref().unwrap_or("");
+                let actual = m.actual_raw_blob_id.as_deref().unwrap_or("");
+                println!(
+                    "ERR: MODIFIED {} expected={} actual={}",
+                    m.rel_path, expected, actual
+                );
+            }
+            VerifyDiffKind::Missing => {
+                println!("ERR: MISSING {}", m.rel_path);
+            }
+            VerifyDiffKind::Extra => {
+                println!("ERR: EXTRA {}", m.rel_path);
+            }
+        }
     }
-    anyhow::bail!("verify failed: {} mismatch(es)", mismatches.len());
+    anyhow::bail!("verify failed: {} mismatch(es)", report.mismatches.len());
 }
 
 #[tokio::main]
@@ -327,8 +360,7 @@ async fn main() -> Result<()> {
 
             let vid = pipe.vault_id.0.to_string();
             let index_dir = vault_indexes_root(&app_root, &pipe.vault_id).join("tantivy");
-            let _ = cupola_search::rebuild_vault_index(pipe.db.pool(), &pipe.cas, &vid, &index_dir)
-                .await?;
+            let _ = rebuild_search_index_for_vault(&pipe.db, &pipe.cas, &vid, &index_dir).await?;
 
             println!("OK: hashed {} files", n);
         }
@@ -437,7 +469,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Search { vault, q, limit } => {
+        Command::Search {
+            vault,
+            q,
+            limit,
+            json,
+        } => {
             let vault_root = vault.canonicalize()?;
             let app_root = app_data_root()?;
 
@@ -449,9 +486,11 @@ async fn main() -> Result<()> {
 
             let vid = vault_id.0.to_string();
             let index_dir = vault_indexes_root(&app_root, &vault_id).join("tantivy");
+            let mut hits: Vec<SearchHitDTO> = Vec::new();
 
-            if cupola_search::index_exists(&index_dir) {
-                let chunk_ids = cupola_search::search_chunk_ids(&index_dir, &q, limit as usize)?;
+            if index_dir.join("meta.json").is_file() {
+                let chunk_ids =
+                    cupola_search::SearchIndex::new(&index_dir)?.search(&q, limit as usize)?;
                 for chunk_id in chunk_ids {
                     let row = sqlx::query(
                         r#"
@@ -478,8 +517,21 @@ async fn main() -> Result<()> {
                     .await?;
 
                     if let Some(r) = row {
-                        print_search_row(&r)?;
+                        let hit = row_to_search_hit(&r)?;
+                        if json {
+                            hits.push(hit);
+                        } else {
+                            print_search_hit(&hit);
+                        }
                     }
+                }
+                if json {
+                    let resp = SearchResponseDTO {
+                        query: q,
+                        limit,
+                        hits,
+                    };
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
                 }
                 return Ok(());
             }
@@ -513,16 +565,33 @@ async fn main() -> Result<()> {
             .await?;
 
             for r in rows {
-                print_search_row(&r)?;
+                let hit = row_to_search_hit(&r)?;
+                if json {
+                    hits.push(hit);
+                } else {
+                    print_search_hit(&hit);
+                }
+            }
+            if json {
+                let resp = SearchResponseDTO {
+                    query: q,
+                    limit,
+                    hits,
+                };
+                println!("{}", serde_json::to_string_pretty(&resp)?);
             }
         }
         Command::Freeze { vault, out } => {
             let app_root = app_data_root()?;
             freeze_vault_with_app_root(vault, out, app_root).await?;
         }
-        Command::Verify { vault, manifest } => {
+        Command::Verify {
+            vault,
+            manifest,
+            json,
+        } => {
             let app_root = app_data_root()?;
-            verify_vault_with_app_root(vault, manifest, app_root).await?;
+            verify_vault_with_app_root(vault, manifest, app_root, json).await?;
         }
     }
 
@@ -555,14 +624,16 @@ mod tests {
             vault.path().to_path_buf(),
             manifest_path.clone(),
             app_root.clone(),
+            false,
         )
         .await?;
 
         std::fs::write(vault.path().join("a.txt"), "changed content")?;
 
-        let err = verify_vault_with_app_root(vault.path().to_path_buf(), manifest_path, app_root)
-            .await
-            .expect_err("verify should fail after file modification");
+        let err =
+            verify_vault_with_app_root(vault.path().to_path_buf(), manifest_path, app_root, false)
+                .await
+                .expect_err("verify should fail after file modification");
         let msg = format!("{err:#}");
         assert!(msg.contains("verify failed"));
         Ok(())

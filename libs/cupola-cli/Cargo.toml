@@ -18,6 +18,7 @@ cupola-db = { path = "../cupola-db" }
 cupola-cas = { path = "../cupola-cas" }
 cupola-indexer = { path = "../cupola-indexer" }
 cupola-search = { path = "../cupola-search" }
+cupola-protocol = { path = "../cupola-protocol" }
 
 [dev-dependencies]
 tempfile = "3"
