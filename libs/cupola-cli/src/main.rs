@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use cupola_cas::CasStore;
-use cupola_core::{app_data_root, now_ns, VaultId};
+use cupola_core::{app_data_root, now_ns, vault_indexes_root, VaultId};
 use cupola_db::DbPool;
 use sqlx::Row;
 use std::path::PathBuf;
@@ -32,7 +32,7 @@ enum Command {
         json: bool,
     },
 
-    /// Search chunks.excerpt (v0 SQLite LIKE) within a vault.
+    /// Search chunks using Tantivy BM25 when index is present; fallback to SQLite LIKE.
     Search {
         /// Absolute or relative path to the vault root folder.
         #[arg(long)]
@@ -100,6 +100,34 @@ async fn ensure_vault(db: &DbPool, vault_root: &std::path::Path) -> anyhow::Resu
 
     Ok(VaultId(id))
 }
+
+fn print_search_row(r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<()> {
+    let rel_path: String = r.try_get("rel_path")?;
+    let excerpt: String = r.try_get("excerpt")?;
+    let chunk_id: String = r.try_get("chunk_id")?;
+    let raw_blob_id: String = r.try_get("raw_blob_id")?;
+    let chunk_blob_id: String = r.try_get("chunk_blob_id")?;
+    let mtime_ns: i64 = r.try_get("mtime_ns")?;
+    let file_type: Option<String> = r.try_get("file_type")?;
+    let start_line: Option<i64> = r.try_get("start_line")?;
+    let end_line: Option<i64> = r.try_get("end_line")?;
+    let mut line_info = String::new();
+    if let (Some(start), Some(end)) = (start_line, end_line) {
+        line_info = format!("{}-{}", start, end);
+    }
+    println!(
+        "{} | {} | [{}] | {} | {} | {} | {} | {}",
+        chunk_id,
+        rel_path,
+        file_type.as_deref().unwrap_or("unknown"),
+        mtime_ns,
+        raw_blob_id,
+        chunk_blob_id,
+        line_info,
+        excerpt.replace('\n', " "),
+    );
+    Ok(())
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -124,6 +152,11 @@ async fn main() -> Result<()> {
 
             let pipe = cupola_indexer::pipeline::Pipeline::new(db, cas, vault_id, vault_root);
             let n = pipe.run_hash_all().await?;
+
+            let vid = pipe.vault_id.0.to_string();
+            let index_dir = vault_indexes_root(&app_root, &pipe.vault_id).join("tantivy");
+            let _ = cupola_search::rebuild_vault_index(pipe.db.pool(), &pipe.cas, &vid, &index_dir)
+                .await?;
 
             println!("OK: hashed {} files", n);
         }
@@ -242,6 +275,43 @@ async fn main() -> Result<()> {
 
             let vault_id = ensure_vault(&db, &vault_root).await?;
 
+            let vid = vault_id.0.to_string();
+            let index_dir = vault_indexes_root(&app_root, &vault_id).join("tantivy");
+
+            if cupola_search::index_exists(&index_dir) {
+                let chunk_ids = cupola_search::search_chunk_ids(&index_dir, &q, limit as usize)?;
+                for chunk_id in chunk_ids {
+                    let row = sqlx::query(
+                        r#"
+                        SELECT
+                            a.rel_path as rel_path,
+                            c.excerpt as excerpt,
+                            c.id as chunk_id,
+                            av.raw_blob_id as raw_blob_id,
+                            c.chunk_blob_id as chunk_blob_id,
+                            av.mtime_ns as mtime_ns,
+                            av.file_type as file_type,
+                            c.start_line as start_line,
+                            c.end_line as end_line
+                        FROM chunks c
+                        JOIN artifact_versions av ON av.id = c.artifact_version_id
+                        JOIN artifacts a ON a.id = av.artifact_id
+                        WHERE a.vault_id = ?1 AND c.id = ?2
+                        LIMIT 1
+                        "#,
+                    )
+                    .bind(&vid)
+                    .bind(&chunk_id)
+                    .fetch_optional(db.pool())
+                    .await?;
+
+                    if let Some(r) = row {
+                        print_search_row(&r)?;
+                    }
+                }
+                return Ok(());
+            }
+
             let like = format!("%{}%", q);
 
             let rows = sqlx::query(
@@ -264,37 +334,14 @@ async fn main() -> Result<()> {
                 LIMIT ?3
                 "#,
             )
-            .bind(vault_id.0.to_string())
+            .bind(vid)
             .bind(&like)
             .bind(limit as i64)
             .fetch_all(db.pool())
             .await?;
 
             for r in rows {
-                let rel_path: String = r.try_get("rel_path")?;
-                let excerpt: String = r.try_get("excerpt")?;
-                let chunk_id: String = r.try_get("chunk_id")?;
-                let raw_blob_id: String = r.try_get("raw_blob_id")?;
-                let chunk_blob_id: String = r.try_get("chunk_blob_id")?;
-                let mtime_ns: i64 = r.try_get("mtime_ns")?;
-                let file_type: Option<String> = r.try_get("file_type")?;
-                let start_line: Option<i64> = r.try_get("start_line")?;
-                let end_line: Option<i64> = r.try_get("end_line")?;
-                let mut line_info = String::new();
-                if let (Some(start), Some(end)) = (start_line, end_line) {
-                    line_info = format!("{}-{}", start, end);
-                }
-                println!(
-                    "{} | {} | [{}] | {} | {} | {} | {} | {}",
-                    chunk_id,
-                    rel_path,
-                    file_type.as_deref().unwrap_or("unknown"),
-                    mtime_ns,
-                    raw_blob_id,
-                    chunk_blob_id,
-                    line_info,
-                    excerpt.replace('\n', " "),
-                );
+                print_search_row(&r)?;
             }
         }
     }

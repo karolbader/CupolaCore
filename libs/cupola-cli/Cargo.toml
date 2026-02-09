@@ -15,5 +15,6 @@ cupola-core = { path = "../cupola-core" }
 cupola-db = { path = "../cupola-db" }
 cupola-cas = { path = "../cupola-cas" }
 cupola-indexer = { path = "../cupola-indexer" }
+cupola-search = { path = "../cupola-search" }
 
 

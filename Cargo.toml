@@ -4,8 +4,10 @@ members = [
   "libs/cupola-db",
   "libs/cupola-core",
   "libs/cupola-indexer",
-  "libs/cupola-protocol"
-, "libs/cupola-cli"]
+  "libs/cupola-protocol",
+  "libs/cupola-cli",
+  "libs/cupola-search",
+]
 
 [workspace.package]
 edition = "2021"
