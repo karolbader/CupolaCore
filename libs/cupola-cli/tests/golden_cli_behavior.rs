@@ -469,3 +469,50 @@ fn replay_json_pass_and_missing_cas_blob_fail() {
         .expect("missing cas_blobs_exist check");
     assert!(!cas_fail_check.ok, "expected cas_blobs_exist to be false");
 }
+
+#[test]
+fn demo_json_summary_passes_with_expected_steps() {
+    let td = TempDir::new().expect("tempdir");
+    let vault = td.path().join("vault");
+    std::fs::create_dir_all(&vault).expect("vault dir");
+    let appdata = td.path().join("appdata");
+    std::fs::create_dir_all(&appdata).expect("appdata dir");
+    let vault_s = vault.to_string_lossy().to_string();
+
+    let out = run_cli(&appdata, &["demo", "--vault", &vault_s, "--json"]);
+    assert!(out.status.success(), "demo --json should pass: {:?}", out);
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !body.contains("OK:") && !body.contains("ERR:"),
+        "stdout mixed human lines when --json set: {body}"
+    );
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid demo json");
+    assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(true));
+    let steps = v
+        .get("steps")
+        .and_then(|x| x.as_array())
+        .expect("steps array");
+    let names: Vec<String> = steps
+        .iter()
+        .filter_map(|s| {
+            s.get("name")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    for expected in [
+        "ensure_demo_file",
+        "hash",
+        "search",
+        "freeze",
+        "verify_pass",
+        "verify_fail_expected",
+        "replay",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "missing step {expected} in {names:?}"
+        );
+    }
+}

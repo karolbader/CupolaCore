@@ -7,7 +7,9 @@ use cupola_core::{
 };
 use cupola_db::DbPool;
 use cupola_protocol::{ReplayCheckDTO, ReplayReportDTO, SearchHitDTO, SearchResponseDTO};
+use serde::Serialize;
 use sqlx::Row;
+use std::io::Write;
 use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "cupola", version, about = "Cupola CLI (v0)")]
@@ -87,6 +89,16 @@ enum Command {
         /// Input manifest JSON path.
         #[arg(long)]
         manifest: PathBuf,
+        /// Emit JSON (machine-readable).
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// One-command local proof loop (hash/search/freeze/verify/replay).
+    Demo {
+        /// Absolute or relative path to the vault root folder.
+        #[arg(long)]
+        vault: PathBuf,
         /// Emit JSON (machine-readable).
         #[arg(long)]
         json: bool,
@@ -500,6 +512,207 @@ fn replay_validation_report(
     }
 }
 
+#[derive(Serialize)]
+struct DemoStep {
+    name: String,
+    ok: bool,
+    detail: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DemoSummary {
+    ok: bool,
+    steps: Vec<DemoStep>,
+    manifest_path: String,
+}
+
+async fn run_demo(vault: PathBuf, json: bool) -> Result<()> {
+    let app_root = app_data_root()?;
+    let vault_root = vault.canonicalize()?;
+    let mut steps: Vec<DemoStep> = Vec::new();
+
+    let demo_file = vault_root.join("_tmp").join("demo.txt");
+    if !demo_file.exists() {
+        if let Some(parent) = demo_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&demo_file, "alpha beta gamma")?;
+        steps.push(DemoStep {
+            name: "ensure_demo_file".to_string(),
+            ok: true,
+            detail: Some("created _tmp/demo.txt".to_string()),
+        });
+    } else {
+        steps.push(DemoStep {
+            name: "ensure_demo_file".to_string(),
+            ok: true,
+            detail: Some("reused _tmp/demo.txt".to_string()),
+        });
+    }
+
+    let db_path = app_root.join("db.sqlite");
+    let db = DbPool::new(&db_path).await?;
+    let vault_id = ensure_vault(&db, &vault_root).await?;
+    let vdir = app_root.join("vaults").join(vault_id.0.to_string());
+    let cas_root = vdir.join("cas");
+    tokio::fs::create_dir_all(&cas_root).await?;
+    let cas = CasStore::new(cas_root);
+
+    let pipe = cupola_indexer::pipeline::Pipeline::new(
+        DbPool::new(&db_path).await?,
+        cas.clone(),
+        vault_id.clone(),
+        vault_root.clone(),
+    );
+    let _ = pipe.run_hash_all().await?;
+    let vid = vault_id.0.to_string();
+    let index_dir = vault_indexes_root(&app_root, &vault_id).join("tantivy");
+    let _ = rebuild_search_index_for_vault(&db, &cas, &vid, &index_dir).await?;
+    steps.push(DemoStep {
+        name: "hash".to_string(),
+        ok: true,
+        detail: None,
+    });
+
+    let search_hits = cupola_search::SearchIndex::new(&index_dir)?.search("alpha", 5)?;
+    steps.push(DemoStep {
+        name: "search".to_string(),
+        ok: !search_hits.is_empty(),
+        detail: if search_hits.is_empty() {
+            Some("no hits for alpha".to_string())
+        } else {
+            None
+        },
+    });
+
+    let manifest_path = app_root.join("demo.manifest.json");
+    let freeze_db = DbPool::new(&db_path).await?;
+    let freeze_vault_id = ensure_vault(&freeze_db, &vault_root).await?;
+    let freeze_vdir = app_root.join("vaults").join(freeze_vault_id.0.to_string());
+    let freeze_cas_root = freeze_vdir.join("cas");
+    tokio::fs::create_dir_all(&freeze_cas_root).await?;
+    let freeze_cas = CasStore::new(freeze_cas_root);
+    let items = cupola_indexer::crawl_sorted(&vault_root)?;
+    let mut artifacts = Vec::with_capacity(items.len());
+    for it in items {
+        let out = cupola_indexer::stages::hash::HashStage::run(
+            &freeze_db,
+            &freeze_cas,
+            &freeze_vault_id,
+            &vault_root,
+            &it.abs_path,
+        )
+        .await?;
+        artifacts.push(ManifestArtifactV0 {
+            rel_path: it.rel_path,
+            raw_blob_id: out.raw_blob_id.as_str().to_string(),
+            mtime_ns: out.mtime_ns,
+            file_size: out.file_size as i64,
+            file_type: out.file_type,
+            artifact_version_id: out.artifact_version_id,
+        });
+    }
+    artifacts.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    let manifest = ManifestV0 {
+        vault_id: freeze_vault_id.0.to_string(),
+        root: vault_root.to_string_lossy().to_string(),
+        created_at: now_ns(),
+        artifacts,
+    };
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    if let Some(parent) = manifest_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&manifest_path, &manifest_bytes).await?;
+    let manifest_blob_id = freeze_cas.put(&manifest_bytes).await?;
+    sqlx::query("INSERT OR IGNORE INTO blobs (hash, size, cas_key) VALUES (?1, ?2, ?3)")
+        .bind(manifest_blob_id.as_str())
+        .bind(manifest_bytes.len() as i64)
+        .bind(manifest_blob_id.as_str())
+        .execute(freeze_db.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO freezes (id, vault_id, created_at, manifest_blob_id) VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(freeze_vault_id.0.to_string())
+    .bind(manifest.created_at)
+    .bind(manifest_blob_id.as_str())
+    .execute(freeze_db.pool())
+    .await?;
+    steps.push(DemoStep {
+        name: "freeze".to_string(),
+        ok: true,
+        detail: None,
+    });
+
+    let verify_pass = cupola_core::verify_manifest(&vault_root, &manifest_path).await?;
+    steps.push(DemoStep {
+        name: "verify_pass".to_string(),
+        ok: verify_pass.ok,
+        detail: if verify_pass.ok {
+            None
+        } else {
+            Some("expected pass but got mismatches".to_string())
+        },
+    });
+
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&demo_file)?;
+        f.write_all(b" delta")?;
+    }
+    let verify_fail = cupola_core::verify_manifest(&vault_root, &manifest_path).await?;
+    let modified_expected = verify_fail
+        .mismatches
+        .iter()
+        .any(|m| matches!(m.kind, VerifyDiffKind::Modified) && m.rel_path == "_tmp/demo.txt");
+    steps.push(DemoStep {
+        name: "verify_fail_expected".to_string(),
+        ok: !verify_fail.ok && modified_expected,
+        detail: if !verify_fail.ok && modified_expected {
+            None
+        } else {
+            Some("expected modified mismatch for _tmp/demo.txt".to_string())
+        },
+    });
+
+    let replay = replay_validation_report(vault_root.clone(), manifest_path.clone(), app_root);
+    steps.push(DemoStep {
+        name: "replay".to_string(),
+        ok: replay.ok,
+        detail: if replay.ok {
+            None
+        } else {
+            Some(format!("replay errors={}", replay.errors.len()))
+        },
+    });
+
+    let summary = DemoSummary {
+        ok: steps.iter().all(|s| s.ok),
+        steps,
+        manifest_path: manifest_path.to_string_lossy().to_string(),
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        for s in &summary.steps {
+            if s.ok {
+                println!("OK: {}", s.name);
+            } else if let Some(detail) = &s.detail {
+                println!("ERR: {} {}", s.name, detail);
+            } else {
+                println!("ERR: {}", s.name);
+            }
+        }
+    }
+
+    if !summary.ok {
+        anyhow::bail!("demo failed");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -795,6 +1008,9 @@ async fn main() -> Result<()> {
             if !report.ok {
                 anyhow::bail!("replay failed: {} error(s)", report.errors.len());
             }
+        }
+        Command::Demo { vault, json } => {
+            run_demo(vault, json).await?;
         }
     }
 
