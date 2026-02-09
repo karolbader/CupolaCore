@@ -111,6 +111,15 @@ fn verify_json_output_pass_and_fail_shapes() {
         ],
     );
     assert!(verify_ok.status.success(), "verify --json pass failed");
+    let out_ok = String::from_utf8_lossy(&verify_ok.stdout);
+    assert!(
+        !out_ok.contains("OK: verify passed"),
+        "stdout mixed human output when --json set: {out_ok}"
+    );
+    assert!(
+        !out_ok.contains("ERR: "),
+        "stdout mixed human output when --json set: {out_ok}"
+    );
     let report_ok: VerifyReport =
         serde_json::from_slice(&verify_ok.stdout).expect("parse verify pass json");
     assert!(report_ok.ok);
@@ -134,11 +143,43 @@ fn verify_json_output_pass_and_fail_shapes() {
         !verify_fail.status.success(),
         "verify --json should fail after modification"
     );
+    let out_fail = String::from_utf8_lossy(&verify_fail.stdout);
+    assert!(
+        !out_fail.contains("OK: verify passed"),
+        "stdout mixed human output when --json set: {out_fail}"
+    );
+    assert!(
+        !out_fail.contains("ERR: "),
+        "stdout mixed human output when --json set: {out_fail}"
+    );
     let report_fail: VerifyReport =
         serde_json::from_slice(&verify_fail.stdout).expect("parse verify fail json");
     assert!(!report_fail.ok);
     assert_eq!(report_fail.artifact_count, 1);
-    assert!(!report_fail.mismatches.is_empty());
+    assert!(
+        !report_fail.mismatches.is_empty(),
+        "expected at least one mismatch"
+    );
+    let modified = report_fail
+        .mismatches
+        .iter()
+        .find(|m| matches!(m.kind, cupola_core::VerifyDiffKind::Modified))
+        .expect("expected Modified mismatch");
+    assert_eq!(modified.rel_path, "a.txt");
+    assert!(
+        modified
+            .expected_raw_blob_id
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()),
+        "expected hash missing/empty"
+    );
+    assert!(
+        modified
+            .actual_raw_blob_id
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()),
+        "actual hash missing/empty"
+    );
 }
 
 #[test]
