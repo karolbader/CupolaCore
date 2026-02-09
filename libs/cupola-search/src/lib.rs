@@ -56,6 +56,9 @@ impl SearchIndex {
         let index = match Index::open_in_dir(index_path) {
             Ok(i) if schema_fields(&i).is_ok() => i,
             Ok(_) | Err(_) => {
+                // v0 safety: if the on-disk index cannot be opened with the expected
+                // schema, rebuild a fresh index directory rather than continuing with
+                // a potentially incompatible layout.
                 if index_path.exists() {
                     let _ = std::fs::remove_dir_all(index_path);
                 }
@@ -115,6 +118,22 @@ mod tests {
         let si = SearchIndex::new(td.path())?;
         let _ = si.ingest_document("chunk-a", "hello tantivy world")?;
         let hits = si.search("tantivy", 10)?;
+        assert_eq!(hits, vec!["chunk-a".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn search_index_persists_across_reopen() -> Result<()> {
+        let td = TempDir::new()?;
+        let index_path = td.path().join("index");
+
+        {
+            let si = SearchIndex::new(&index_path)?;
+            let _ = si.ingest_document("chunk-a", "alpha beta")?;
+        }
+
+        let reopened = SearchIndex::new(&index_path)?;
+        let hits = reopened.search("alpha", 10)?;
         assert_eq!(hits, vec!["chunk-a".to_string()]);
         Ok(())
     }
