@@ -385,17 +385,14 @@ fn replay_validation_report(
         errors.push("manifest path missing".to_string());
     }
 
-    let manifest_valid_json = if manifest_exists {
-        match std::fs::read(&manifest_path)
+    let parsed_manifest = if manifest_exists {
+        std::fs::read(&manifest_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<ManifestV0>(&bytes).ok())
-        {
-            Some(_) => true,
-            None => false,
-        }
     } else {
-        false
+        None
     };
+    let manifest_valid_json = parsed_manifest.is_some();
     checks.push(ReplayCheckDTO {
         name: "manifest_valid_json".to_string(),
         ok: manifest_valid_json,
@@ -446,6 +443,52 @@ fn replay_validation_report(
     });
     if !index_exists {
         errors.push("index dir missing".to_string());
+    }
+
+    let mut missing_blob_ids: Vec<String> = Vec::new();
+    if let Some(manifest) = &parsed_manifest {
+        let cas_root = app_root.join("vaults").join(&manifest.vault_id).join("cas");
+        let cas = CasStore::new(cas_root);
+        for a in &manifest.artifacts {
+            let blob_path = cas.shard_path(&a.raw_blob_id);
+            if !blob_path.is_file() {
+                missing_blob_ids.push(a.raw_blob_id.clone());
+            }
+        }
+    }
+    let cas_ok = manifest_valid_json && missing_blob_ids.is_empty();
+    checks.push(ReplayCheckDTO {
+        name: "cas_blobs_exist".to_string(),
+        ok: cas_ok,
+        detail: if !manifest_valid_json {
+            Some("manifest invalid; CAS check skipped".to_string())
+        } else if missing_blob_ids.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "missing={} total={}",
+                missing_blob_ids.len(),
+                parsed_manifest
+                    .as_ref()
+                    .map(|m| m.artifacts.len())
+                    .unwrap_or_default()
+            ))
+        },
+    });
+    if !cas_ok {
+        if !manifest_valid_json {
+            errors.push("cas check skipped due to invalid manifest".to_string());
+        } else {
+            for id in missing_blob_ids.iter().take(20) {
+                errors.push(format!("missing blob: {id}"));
+            }
+            if missing_blob_ids.len() > 20 {
+                errors.push(format!(
+                    "... {} more missing blobs",
+                    missing_blob_ids.len() - 20
+                ));
+            }
+        }
     }
 
     ReplayReportDTO {
@@ -727,6 +770,19 @@ async fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
+                if let Some(cas_check) = report.checks.iter().find(|c| c.name == "cas_blobs_exist")
+                {
+                    if cas_check.ok {
+                        println!("OK: cas_blobs_exist");
+                    } else {
+                        let detail = cas_check.detail.as_deref().unwrap_or("");
+                        if detail.is_empty() {
+                            println!("ERR: cas_blobs_exist");
+                        } else {
+                            println!("ERR: cas_blobs_exist {detail}");
+                        }
+                    }
+                }
                 if report.ok {
                     println!("OK: replay validation passed");
                 } else {

@@ -1,4 +1,4 @@
-use cupola_core::VerifyReport;
+use cupola_core::{ManifestV0, VerifyReport};
 use cupola_protocol::{ReplayReportDTO, SearchResponseDTO};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -367,7 +367,7 @@ fn search_json_contract_is_valid_and_deterministic_for_alpha_query() {
 }
 
 #[test]
-fn replay_json_pass_and_missing_manifest_fail() {
+fn replay_json_pass_and_missing_cas_blob_fail() {
     let (_td, vault, appdata) = setup_vault_with_file("a.txt", "hello\n");
     let manifest = vault.with_extension("freeze.json");
     let vault_s = vault.to_string_lossy().to_string();
@@ -402,10 +402,35 @@ fn replay_json_pass_and_missing_manifest_fail() {
         serde_json::from_slice(&replay_ok.stdout).expect("parse replay pass json");
     assert!(report_ok.ok);
     assert!(report_ok.errors.is_empty());
-    assert!(!report_ok.checks.is_empty());
+    let cas_ok_check = report_ok
+        .checks
+        .iter()
+        .find(|c| c.name == "cas_blobs_exist")
+        .expect("missing cas_blobs_exist check");
+    assert!(cas_ok_check.ok, "expected cas_blobs_exist to be true");
 
-    let missing_manifest = vault.join("missing.freeze.json");
-    let missing_s = missing_manifest.to_string_lossy().to_string();
+    let manifest_obj: ManifestV0 =
+        serde_json::from_slice(&std::fs::read(&manifest).expect("read manifest"))
+            .expect("parse manifest");
+    let victim_blob_id = manifest_obj
+        .artifacts
+        .first()
+        .expect("at least one artifact")
+        .raw_blob_id
+        .clone();
+    let cas_root = appdata
+        .join("Cupola")
+        .join("vaults")
+        .join(&manifest_obj.vault_id)
+        .join("cas");
+    let cas = cupola_cas::CasStore::new(cas_root);
+    let victim_blob_path = cas.shard_path(&victim_blob_id);
+    assert!(
+        victim_blob_path.is_file(),
+        "expected blob to exist before deletion"
+    );
+    std::fs::remove_file(&victim_blob_path).expect("delete blob");
+
     let replay_fail = run_cli(
         &appdata,
         &[
@@ -413,13 +438,13 @@ fn replay_json_pass_and_missing_manifest_fail() {
             "--vault",
             &vault_s,
             "--manifest",
-            &missing_s,
+            &manifest_s,
             "--json",
         ],
     );
     assert!(
         !replay_fail.status.success(),
-        "replay --json should fail for missing manifest"
+        "replay --json should fail for missing CAS blob"
     );
     let out_fail = String::from_utf8_lossy(&replay_fail.stdout);
     assert!(
@@ -430,4 +455,17 @@ fn replay_json_pass_and_missing_manifest_fail() {
         serde_json::from_slice(&replay_fail.stdout).expect("parse replay fail json");
     assert!(!report_fail.ok);
     assert!(!report_fail.errors.is_empty());
+    assert!(
+        report_fail
+            .errors
+            .iter()
+            .any(|e| e.contains("missing blob:")),
+        "expected missing blob error"
+    );
+    let cas_fail_check = report_fail
+        .checks
+        .iter()
+        .find(|c| c.name == "cas_blobs_exist")
+        .expect("missing cas_blobs_exist check");
+    assert!(!cas_fail_check.ok, "expected cas_blobs_exist to be false");
 }
