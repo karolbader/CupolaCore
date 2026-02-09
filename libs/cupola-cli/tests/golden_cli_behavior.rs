@@ -515,4 +515,19 @@ fn demo_json_summary_passes_with_expected_steps() {
             "missing step {expected} in {names:?}"
         );
     }
+    let search_sample = v.get("search_sample").expect("search_sample object");
+    assert!(
+        search_sample
+            .get("chunk_id")
+            .and_then(|x| x.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        "search_sample.chunk_id missing/empty: {search_sample}"
+    );
+    assert!(
+        search_sample
+            .get("rel_path")
+            .and_then(|x| x.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        "search_sample.rel_path missing/empty: {search_sample}"
+    );
 }

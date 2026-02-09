@@ -524,6 +524,7 @@ struct DemoSummary {
     ok: bool,
     steps: Vec<DemoStep>,
     manifest_path: String,
+    search_sample: Option<SearchHitDTO>,
 }
 
 async fn run_demo(vault: PathBuf, json: bool) -> Result<()> {
@@ -575,6 +576,38 @@ async fn run_demo(vault: PathBuf, json: bool) -> Result<()> {
     });
 
     let search_hits = cupola_search::SearchIndex::new(&index_dir)?.search("alpha", 5)?;
+    let search_sample = if let Some(first_chunk_id) = search_hits.first() {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                a.rel_path as rel_path,
+                c.excerpt as excerpt,
+                c.id as chunk_id,
+                av.raw_blob_id as raw_blob_id,
+                c.chunk_blob_id as chunk_blob_id,
+                av.mtime_ns as mtime_ns,
+                av.file_type as file_type,
+                c.start_line as start_line,
+                c.end_line as end_line
+            FROM chunks c
+            JOIN artifact_versions av ON av.id = c.artifact_version_id
+            JOIN artifacts a ON a.id = av.artifact_id
+            WHERE a.vault_id = ?1 AND c.id = ?2
+            LIMIT 1
+            "#,
+        )
+        .bind(&vid)
+        .bind(first_chunk_id)
+        .fetch_optional(db.pool())
+        .await?;
+        if let Some(r) = row {
+            Some(row_to_search_hit(&r)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     steps.push(DemoStep {
         name: "search".to_string(),
         ok: !search_hits.is_empty(),
@@ -691,6 +724,7 @@ async fn run_demo(vault: PathBuf, json: bool) -> Result<()> {
         ok: steps.iter().all(|s| s.ok),
         steps,
         manifest_path: manifest_path.to_string_lossy().to_string(),
+        search_sample,
     };
 
     if json {
