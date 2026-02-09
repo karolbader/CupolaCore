@@ -24,3 +24,19 @@ pub struct SearchResponseDTO {
     pub limit: u32,
     pub hits: Vec<SearchHitDTO>,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReplayCheckDTO {
+    pub name: String,
+    pub ok: bool,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReplayReportDTO {
+    pub ok: bool,
+    pub vault_path: String,
+    pub manifest_path: String,
+    pub checks: Vec<ReplayCheckDTO>,
+    pub errors: Vec<String>,
+}

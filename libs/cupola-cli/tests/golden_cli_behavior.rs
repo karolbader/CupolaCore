@@ -1,5 +1,5 @@
 use cupola_core::VerifyReport;
-use cupola_protocol::SearchResponseDTO;
+use cupola_protocol::{ReplayReportDTO, SearchResponseDTO};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
@@ -364,4 +364,70 @@ fn search_json_contract_is_valid_and_deterministic_for_alpha_query() {
         })
         .collect();
     assert_eq!(ids1, ids2, "chunk_id ordering changed between runs");
+}
+
+#[test]
+fn replay_json_pass_and_missing_manifest_fail() {
+    let (_td, vault, appdata) = setup_vault_with_file("a.txt", "hello\n");
+    let manifest = vault.with_extension("freeze.json");
+    let vault_s = vault.to_string_lossy().to_string();
+    let manifest_s = manifest.to_string_lossy().to_string();
+
+    let hash = run_cli(&appdata, &["hash", "--vault", &vault_s]);
+    assert!(hash.status.success(), "hash failed: {:?}", hash);
+    let freeze = run_cli(
+        &appdata,
+        &["freeze", "--vault", &vault_s, "--out", &manifest_s],
+    );
+    assert!(freeze.status.success(), "freeze failed: {:?}", freeze);
+
+    let replay_ok = run_cli(
+        &appdata,
+        &[
+            "replay",
+            "--vault",
+            &vault_s,
+            "--manifest",
+            &manifest_s,
+            "--json",
+        ],
+    );
+    assert!(replay_ok.status.success(), "replay --json should pass");
+    let out_ok = String::from_utf8_lossy(&replay_ok.stdout);
+    assert!(
+        !out_ok.contains("OK:") && !out_ok.contains("ERR:"),
+        "stdout mixed human lines when --json set: {out_ok}"
+    );
+    let report_ok: ReplayReportDTO =
+        serde_json::from_slice(&replay_ok.stdout).expect("parse replay pass json");
+    assert!(report_ok.ok);
+    assert!(report_ok.errors.is_empty());
+    assert!(!report_ok.checks.is_empty());
+
+    let missing_manifest = vault.join("missing.freeze.json");
+    let missing_s = missing_manifest.to_string_lossy().to_string();
+    let replay_fail = run_cli(
+        &appdata,
+        &[
+            "replay",
+            "--vault",
+            &vault_s,
+            "--manifest",
+            &missing_s,
+            "--json",
+        ],
+    );
+    assert!(
+        !replay_fail.status.success(),
+        "replay --json should fail for missing manifest"
+    );
+    let out_fail = String::from_utf8_lossy(&replay_fail.stdout);
+    assert!(
+        !out_fail.contains("OK:") && !out_fail.contains("ERR:"),
+        "stdout mixed human lines when --json set: {out_fail}"
+    );
+    let report_fail: ReplayReportDTO =
+        serde_json::from_slice(&replay_fail.stdout).expect("parse replay fail json");
+    assert!(!report_fail.ok);
+    assert!(!report_fail.errors.is_empty());
 }

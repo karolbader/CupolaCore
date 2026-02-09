@@ -2,11 +2,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use cupola_cas::CasStore;
 use cupola_core::{
-    app_data_root, now_ns, vault_indexes_root, ManifestArtifactV0, ManifestV0, VaultId,
-    VerifyDiffKind,
+    app_data_root, deterministic_vault_id_from_root_path, now_ns, vault_indexes_root,
+    ManifestArtifactV0, ManifestV0, VaultId, VerifyDiffKind,
 };
 use cupola_db::DbPool;
-use cupola_protocol::{SearchHitDTO, SearchResponseDTO};
+use cupola_protocol::{ReplayCheckDTO, ReplayReportDTO, SearchHitDTO, SearchResponseDTO};
 use sqlx::Row;
 use std::path::PathBuf;
 #[derive(Parser, Debug)]
@@ -74,6 +74,19 @@ enum Command {
         #[arg(long)]
         manifest: PathBuf,
 
+        /// Emit JSON (machine-readable).
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Replay (validation-only): check required artifacts exist for a manifest/vault pair.
+    Replay {
+        /// Absolute or relative path to the vault root folder.
+        #[arg(long)]
+        vault: PathBuf,
+        /// Input manifest JSON path.
+        #[arg(long)]
+        manifest: PathBuf,
         /// Emit JSON (machine-readable).
         #[arg(long)]
         json: bool,
@@ -331,6 +344,117 @@ async fn verify_vault_with_app_root(
         }
     }
     anyhow::bail!("verify failed: {} mismatch(es)", report.mismatches.len());
+}
+
+fn replay_validation_report(
+    vault: PathBuf,
+    manifest_path: PathBuf,
+    app_root: PathBuf,
+) -> ReplayReportDTO {
+    let vault_path_s = vault.to_string_lossy().to_string();
+    let manifest_path_s = manifest_path.to_string_lossy().to_string();
+
+    let mut checks: Vec<ReplayCheckDTO> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    let vault_exists = vault.is_dir();
+    checks.push(ReplayCheckDTO {
+        name: "vault_exists".to_string(),
+        ok: vault_exists,
+        detail: if vault_exists {
+            None
+        } else {
+            Some("vault path does not exist or is not a directory".to_string())
+        },
+    });
+    if !vault_exists {
+        errors.push("vault path missing".to_string());
+    }
+
+    let manifest_exists = manifest_path.is_file();
+    checks.push(ReplayCheckDTO {
+        name: "manifest_exists".to_string(),
+        ok: manifest_exists,
+        detail: if manifest_exists {
+            None
+        } else {
+            Some("manifest file does not exist".to_string())
+        },
+    });
+    if !manifest_exists {
+        errors.push("manifest path missing".to_string());
+    }
+
+    let manifest_valid_json = if manifest_exists {
+        match std::fs::read(&manifest_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ManifestV0>(&bytes).ok())
+        {
+            Some(_) => true,
+            None => false,
+        }
+    } else {
+        false
+    };
+    checks.push(ReplayCheckDTO {
+        name: "manifest_valid_json".to_string(),
+        ok: manifest_valid_json,
+        detail: if manifest_valid_json {
+            None
+        } else {
+            Some("manifest is not valid ManifestV0 JSON".to_string())
+        },
+    });
+    if !manifest_valid_json {
+        errors.push("manifest json invalid".to_string());
+    }
+
+    let db_exists = app_root.join("db.sqlite").is_file();
+    checks.push(ReplayCheckDTO {
+        name: "db_exists".to_string(),
+        ok: db_exists,
+        detail: if db_exists {
+            None
+        } else {
+            Some("app db file missing".to_string())
+        },
+    });
+    if !db_exists {
+        errors.push("db file missing".to_string());
+    }
+
+    let vault_root_for_id = if vault_exists {
+        vault
+            .canonicalize()
+            .unwrap_or_else(|_| vault.clone())
+            .to_string_lossy()
+            .to_string()
+    } else {
+        vault_path_s.clone()
+    };
+    let vault_id = deterministic_vault_id_from_root_path(&vault_root_for_id);
+    let index_dir = vault_indexes_root(&app_root, &vault_id).join("tantivy");
+    let index_exists = index_dir.is_dir();
+    checks.push(ReplayCheckDTO {
+        name: "index_dir_exists".to_string(),
+        ok: index_exists,
+        detail: if index_exists {
+            None
+        } else {
+            Some(format!("index dir missing at {}", index_dir.display()))
+        },
+    });
+    if !index_exists {
+        errors.push("index dir missing".to_string());
+    }
+
+    ReplayReportDTO {
+        ok: errors.is_empty(),
+        vault_path: vault_path_s,
+        manifest_path: manifest_path_s,
+        checks,
+        errors,
+    }
 }
 
 #[tokio::main]
@@ -592,6 +716,29 @@ async fn main() -> Result<()> {
         } => {
             let app_root = app_data_root()?;
             verify_vault_with_app_root(vault, manifest, app_root, json).await?;
+        }
+        Command::Replay {
+            vault,
+            manifest,
+            json,
+        } => {
+            let app_root = app_data_root()?;
+            let report = replay_validation_report(vault, manifest, app_root);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                if report.ok {
+                    println!("OK: replay validation passed");
+                } else {
+                    for e in &report.errors {
+                        println!("ERR: {e}");
+                    }
+                    println!("ERR: replay validation failed");
+                }
+            }
+            if !report.ok {
+                anyhow::bail!("replay failed: {} error(s)", report.errors.len());
+            }
         }
     }
 
