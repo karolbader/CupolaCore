@@ -42,3 +42,9 @@ Thumbs.db
 /_vault*/
 # Editor/patch backups
 *.bak-*
+
+# demo outputs
+_vault_*.freeze.json
+_tmp/
+docs/_tmp/
+
