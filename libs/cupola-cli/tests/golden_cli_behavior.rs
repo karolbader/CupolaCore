@@ -230,3 +230,97 @@ fn search_json_matches_human_order_and_is_stable() {
     let json_chunk_ids_2: Vec<String> = r2.hits.iter().map(|h| h.chunk_id.clone()).collect();
     assert_eq!(json_chunk_ids_2, json_chunk_ids_1);
 }
+
+#[test]
+fn search_json_contract_is_valid_and_deterministic_for_alpha_query() {
+    let td = TempDir::new().expect("tempdir");
+    let vault = td.path().join("vault");
+    std::fs::create_dir_all(&vault).expect("vault dir");
+    std::fs::write(vault.join("a.txt"), "alpha beta gamma\n").expect("write a");
+    std::fs::write(vault.join("b.txt"), "alpha delta\n").expect("write b");
+    let appdata = td.path().join("appdata");
+    std::fs::create_dir_all(&appdata).expect("appdata dir");
+    let vault_s = vault.to_string_lossy().to_string();
+
+    let hash = run_cli(&appdata, &["hash", "--vault", &vault_s]);
+    assert!(hash.status.success(), "hash failed: {:?}", hash);
+
+    let run1 = run_cli(
+        &appdata,
+        &[
+            "search", "--vault", &vault_s, "--q", "alpha", "--limit", "20", "--json",
+        ],
+    );
+    assert!(
+        run1.status.success(),
+        "search --json run1 failed: {:?}",
+        run1
+    );
+    let out1 = String::from_utf8_lossy(&run1.stdout);
+    assert!(
+        !out1.contains(" | "),
+        "stdout mixed human lines when --json set: {out1}"
+    );
+    let v1: serde_json::Value = serde_json::from_slice(&run1.stdout).expect("valid json run1");
+
+    let run2 = run_cli(
+        &appdata,
+        &[
+            "search", "--vault", &vault_s, "--q", "alpha", "--limit", "20", "--json",
+        ],
+    );
+    assert!(
+        run2.status.success(),
+        "search --json run2 failed: {:?}",
+        run2
+    );
+    let out2 = String::from_utf8_lossy(&run2.stdout);
+    assert!(
+        !out2.contains(" | "),
+        "stdout mixed human lines when --json set: {out2}"
+    );
+    let v2: serde_json::Value = serde_json::from_slice(&run2.stdout).expect("valid json run2");
+
+    assert_eq!(v1.get("query").and_then(|v| v.as_str()), Some("alpha"));
+    assert_eq!(v1.get("limit").and_then(|v| v.as_u64()), Some(20));
+    let hits1 = v1
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .expect("hits array in run1");
+    let hits2 = v2
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .expect("hits array in run2");
+    assert!(!hits1.is_empty(), "expected at least one hit");
+
+    for hit in hits1 {
+        assert!(
+            hit.get("chunk_id").and_then(|v| v.as_str()).is_some(),
+            "missing chunk_id in hit: {hit}"
+        );
+        assert!(
+            hit.get("rel_path").and_then(|v| v.as_str()).is_some(),
+            "missing rel_path in hit: {hit}"
+        );
+    }
+
+    let ids1: Vec<String> = hits1
+        .iter()
+        .map(|h| {
+            h.get("chunk_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    let ids2: Vec<String> = hits2
+        .iter()
+        .map(|h| {
+            h.get("chunk_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(ids1, ids2, "chunk_id ordering changed between runs");
+}
