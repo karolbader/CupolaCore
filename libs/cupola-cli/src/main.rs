@@ -6,7 +6,10 @@ use cupola_core::{
     ManifestArtifactV0, ManifestV0, VaultId, VerifyDiffKind,
 };
 use cupola_db::DbPool;
-use cupola_protocol::{ReplayCheckDTO, ReplayReportDTO, SearchHitDTO, SearchResponseDTO};
+use cupola_protocol::{
+    EnvelopeDTO, ReplayCheckDTO, ReplayReportDTO, SearchHitDTO, SearchResponseDTO, ToolInfoDTO,
+    VaultInfoDTO,
+};
 use serde::Serialize;
 use sqlx::Row;
 use std::io::Write;
@@ -14,6 +17,10 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "cupola", version, about = "Cupola CLI (v0)")]
 struct Cli {
+    /// Override application data root (portable mode). Default: %APPDATA%\Cupola
+    #[arg(long, global = true, value_name = "DIR")]
+    app_root: Option<PathBuf>,
+
     #[command(subcommand)]
     cmd: Command,
 }
@@ -110,6 +117,19 @@ enum Command {
         #[arg(long)]
         file: PathBuf,
     },
+}
+
+fn resolve_app_root(app_root: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = app_root {
+        let abs = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        std::fs::create_dir_all(&abs)?;
+        return Ok(abs.canonicalize().unwrap_or(abs));
+    }
+    app_data_root()
 }
 
 async fn ensure_vault(db: &DbPool, vault_root: &std::path::Path) -> anyhow::Result<VaultId> {
@@ -521,14 +541,16 @@ struct DemoStep {
 
 #[derive(Serialize)]
 struct DemoSummary {
+    #[serde(flatten)]
+    env: EnvelopeDTO,
     ok: bool,
     steps: Vec<DemoStep>,
     manifest_path: String,
     search_sample: Option<SearchHitDTO>,
 }
 
-async fn run_demo(vault: PathBuf, json: bool) -> Result<()> {
-    let app_root = app_data_root()?;
+async fn run_demo(vault: PathBuf, json: bool, app_root: PathBuf) -> Result<()> {
+    let vault_path = vault.to_string_lossy().to_string();
     let vault_root = vault.canonicalize()?;
     let mut steps: Vec<DemoStep> = Vec::new();
 
@@ -721,6 +743,24 @@ async fn run_demo(vault: PathBuf, json: bool) -> Result<()> {
     });
 
     let summary = DemoSummary {
+        env: EnvelopeDTO {
+            schema_version: "1.0.0".to_string(),
+            tool: ToolInfoDTO {
+                name: "cupola-cli".to_string(),
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                build: if cfg!(debug_assertions) {
+                    "debug".to_string()
+                } else {
+                    "release".to_string()
+                },
+                platform: "windows-x64".to_string(),
+            },
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            vault: VaultInfoDTO {
+                vault_path: vault_path.clone(),
+                vault_id: None,
+            },
+        },
         ok: steps.iter().all(|s| s.ok),
         steps,
         manifest_path: manifest_path.to_string_lossy().to_string(),
@@ -749,12 +789,12 @@ async fn run_demo(vault: PathBuf, json: bool) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let Cli { cmd, app_root } = Cli::parse();
 
-    match cli.cmd {
+    match cmd {
         Command::Hash { vault } => {
             let vault_root = vault.canonicalize()?;
-            let app_root = app_data_root()?;
+            let app_root = resolve_app_root(app_root.clone())?;
 
             // Global DB for all vaults (v0): app_root\db.sqlite
             let db_path = app_root.join("db.sqlite");
@@ -799,7 +839,7 @@ async fn main() -> Result<()> {
         }
         Command::Status { vault, json } => {
             let vault_root = vault.canonicalize()?;
-            let app_root = app_data_root()?;
+            let app_root = resolve_app_root(app_root.clone())?;
 
             let db_path = app_root.join("db.sqlite");
             let db = DbPool::new(&db_path).await?;
@@ -890,7 +930,8 @@ async fn main() -> Result<()> {
             json,
         } => {
             let vault_root = vault.canonicalize()?;
-            let app_root = app_data_root()?;
+            let vault_path = vault.to_string_lossy().to_string();
+            let app_root = resolve_app_root(app_root.clone())?;
 
             // Global DB for all vaults (v0): app_root\db.sqlite
             let db_path = app_root.join("db.sqlite");
@@ -901,6 +942,24 @@ async fn main() -> Result<()> {
             let vid = vault_id.0.to_string();
             let index_dir = vault_indexes_root(&app_root, &vault_id).join("tantivy");
             let mut hits: Vec<SearchHitDTO> = Vec::new();
+            let make_env = || EnvelopeDTO {
+                schema_version: "1.0.0".to_string(),
+                tool: ToolInfoDTO {
+                    name: "cupola-cli".to_string(),
+                    version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    build: if cfg!(debug_assertions) {
+                        "debug".to_string()
+                    } else {
+                        "release".to_string()
+                    },
+                    platform: "windows-x64".to_string(),
+                },
+                generated_at: chrono::Utc::now().to_rfc3339(),
+                vault: VaultInfoDTO {
+                    vault_path: vault_path.clone(),
+                    vault_id: None,
+                },
+            };
 
             if index_dir.join("meta.json").is_file() {
                 let chunk_ids =
@@ -941,8 +1000,9 @@ async fn main() -> Result<()> {
                 }
                 if json {
                     let resp = SearchResponseDTO {
-                        query: q,
-                        limit,
+                        env: make_env(),
+                        query: q.clone(),
+                        limit: limit as u32,
                         hits,
                     };
                     println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -988,15 +1048,16 @@ async fn main() -> Result<()> {
             }
             if json {
                 let resp = SearchResponseDTO {
-                    query: q,
-                    limit,
+                    env: make_env(),
+                    query: q.clone(),
+                    limit: limit as u32,
                     hits,
                 };
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             }
         }
         Command::Freeze { vault, out } => {
-            let app_root = app_data_root()?;
+            let app_root = resolve_app_root(app_root.clone())?;
             freeze_vault_with_app_root(vault, out, app_root).await?;
         }
         Command::Verify {
@@ -1004,7 +1065,7 @@ async fn main() -> Result<()> {
             manifest,
             json,
         } => {
-            let app_root = app_data_root()?;
+            let app_root = resolve_app_root(app_root.clone())?;
             verify_vault_with_app_root(vault, manifest, app_root, json).await?;
         }
         Command::Replay {
@@ -1012,7 +1073,7 @@ async fn main() -> Result<()> {
             manifest,
             json,
         } => {
-            let app_root = app_data_root()?;
+            let app_root = resolve_app_root(app_root.clone())?;
             let report = replay_validation_report(vault, manifest, app_root);
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1044,7 +1105,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::Demo { vault, json } => {
-            run_demo(vault, json).await?;
+            let app_root = resolve_app_root(app_root.clone())?;
+            run_demo(vault, json, app_root).await?;
         }
     }
 

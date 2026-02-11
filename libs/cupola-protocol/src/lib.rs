@@ -18,8 +18,32 @@ pub struct SearchHitDTO {
     pub excerpt: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolInfoDTO {
+    pub name: String,
+    pub version: Option<String>,
+    pub build: String,
+    pub platform: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VaultInfoDTO {
+    pub vault_path: String,
+    pub vault_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EnvelopeDTO {
+    pub schema_version: String,
+    pub tool: ToolInfoDTO,
+    pub generated_at: String,
+    pub vault: VaultInfoDTO,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResponseDTO {
+    #[serde(flatten)]
+    pub env: EnvelopeDTO,
     pub query: String,
     pub limit: u32,
     pub hits: Vec<SearchHitDTO>,
