@@ -132,6 +132,38 @@ fn resolve_app_root(app_root: Option<PathBuf>) -> Result<PathBuf> {
     app_data_root()
 }
 
+fn resolve_demo_app_root(
+    cli_app_root: Option<PathBuf>,
+    vault: &std::path::Path,
+) -> Result<PathBuf> {
+    if let Some(p) = cli_app_root {
+        return resolve_app_root(Some(p));
+    }
+    resolve_app_root(Some(vault.join(".cupola_app")))
+}
+
+fn is_lock_or_perm_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("failed to acquire lockfile")
+        || m.contains("tantivy error")
+        || m.contains("database is locked")
+        || m.contains("sqlite_busy")
+        || m.contains("access is denied")
+        || m.contains("os error 5")
+        || m.contains("permissiondenied")
+        || m.contains("permission denied")
+}
+
+fn print_app_root_hint_if_relevant(err: &anyhow::Error, app_root: &std::path::Path) {
+    let msg = format!("{:#}", err);
+    if is_lock_or_perm_error(&msg) {
+        eprintln!(
+            "App root locked or not writable: {}. Close other Cupola processes or rerun with --app-root E:\\CupolaSession",
+            app_root.display()
+        );
+    }
+}
+
 async fn ensure_vault(db: &DbPool, vault_root: &std::path::Path) -> anyhow::Result<VaultId> {
     let root_path = vault_root.to_string_lossy().to_string();
 
@@ -790,148 +822,154 @@ async fn run_demo(vault: PathBuf, json: bool, app_root: PathBuf) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let Cli { cmd, app_root } = Cli::parse();
+    let resolved_app_root = match &cmd {
+        Command::Demo { vault, .. } => resolve_demo_app_root(app_root.clone(), vault)?,
+        _ => resolve_app_root(app_root.clone())?,
+    };
 
-    match cmd {
-        Command::Hash { vault } => {
-            let vault_root = vault.canonicalize()?;
-            let app_root = resolve_app_root(app_root.clone())?;
+    let result: Result<()> = async {
+        match cmd {
+            Command::Hash { vault } => {
+                let vault_root = vault.canonicalize()?;
+                let app_root = resolved_app_root.clone();
 
-            // Global DB for all vaults (v0): app_root\db.sqlite
-            let db_path = app_root.join("db.sqlite");
-            let db = DbPool::new(&db_path).await?;
+                // Global DB for all vaults (v0): app_root\db.sqlite
+                let db_path = app_root.join("db.sqlite");
+                let db = DbPool::new(&db_path).await?;
 
-            // Vault identity lives in DB (unique by root_path). This makes reruns stable.
-            let vault_id = ensure_vault(&db, &vault_root).await?;
+                // Vault identity lives in DB (unique by root_path). This makes reruns stable.
+                let vault_id = ensure_vault(&db, &vault_root).await?;
 
-            // Per-vault storage layout
-            let vdir = app_root.join("vaults").join(vault_id.0.to_string());
-            let cas_root = vdir.join("cas");
-            tokio::fs::create_dir_all(&cas_root).await?;
-            let cas = CasStore::new(cas_root);
+                // Per-vault storage layout
+                let vdir = app_root.join("vaults").join(vault_id.0.to_string());
+                let cas_root = vdir.join("cas");
+                tokio::fs::create_dir_all(&cas_root).await?;
+                let cas = CasStore::new(cas_root);
 
-            let pipe = cupola_indexer::pipeline::Pipeline::new(db, cas, vault_id, vault_root);
-            let n = pipe.run_hash_all().await?;
+                let pipe = cupola_indexer::pipeline::Pipeline::new(db, cas, vault_id, vault_root);
+                let n = pipe.run_hash_all().await?;
 
-            let vid = pipe.vault_id.0.to_string();
-            let index_dir = vault_indexes_root(&app_root, &pipe.vault_id).join("tantivy");
-            let _ = rebuild_search_index_for_vault(&pipe.db, &pipe.cas, &vid, &index_dir).await?;
+                let vid = pipe.vault_id.0.to_string();
+                let index_dir = vault_indexes_root(&app_root, &pipe.vault_id).join("tantivy");
+                let _ =
+                    rebuild_search_index_for_vault(&pipe.db, &pipe.cas, &vid, &index_dir).await?;
 
-            println!("OK: hashed {} files", n);
-        }
-        Command::Blake3 { file } => {
-            use std::io::Read;
-
-            let path = file.canonicalize()?;
-            let mut f = std::fs::File::open(&path)?;
-            let mut h = blake3::Hasher::new();
-            let mut buf = vec![0u8; 1024 * 1024];
-
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
+                println!("OK: hashed {} files", n);
             }
+            Command::Blake3 { file } => {
+                use std::io::Read;
 
-            let hex = h.finalize().to_hex().to_string();
-            println!("BLAKE3 {} {}", hex, path.display());
-        }
-        Command::Status { vault, json } => {
-            let vault_root = vault.canonicalize()?;
-            let app_root = resolve_app_root(app_root.clone())?;
+                let path = file.canonicalize()?;
+                let mut f = std::fs::File::open(&path)?;
+                let mut h = blake3::Hasher::new();
+                let mut buf = vec![0u8; 1024 * 1024];
 
-            let db_path = app_root.join("db.sqlite");
-            let db = DbPool::new(&db_path).await?;
+                loop {
+                    let n = f.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    h.update(&buf[..n]);
+                }
 
-            let vault_id = ensure_vault(&db, &vault_root).await?;
-            let vid = vault_id.0.to_string();
+                let hex = h.finalize().to_hex().to_string();
+                println!("BLAKE3 {} {}", hex, path.display());
+            }
+            Command::Status { vault, json } => {
+                let vault_root = vault.canonicalize()?;
+                let app_root = resolved_app_root.clone();
 
-            let artifacts: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE vault_id = ?1")
-                    .bind(&vid)
-                    .fetch_one(db.pool())
-                    .await?;
+                let db_path = app_root.join("db.sqlite");
+                let db = DbPool::new(&db_path).await?;
 
-            let versions: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM artifact_versions av
+                let vault_id = ensure_vault(&db, &vault_root).await?;
+                let vid = vault_id.0.to_string();
+
+                let artifacts: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE vault_id = ?1")
+                        .bind(&vid)
+                        .fetch_one(db.pool())
+                        .await?;
+
+                let versions: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM artifact_versions av
                  JOIN artifacts a ON a.id = av.artifact_id
                  WHERE a.vault_id = ?1",
-            )
-            .bind(&vid)
-            .fetch_one(db.pool())
-            .await?;
+                )
+                .bind(&vid)
+                .fetch_one(db.pool())
+                .await?;
 
-            let chunks: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM chunks c
+                let chunks: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM chunks c
                  JOIN artifact_versions av ON av.id = c.artifact_version_id
                  JOIN artifacts a ON a.id = av.artifact_id
                  WHERE a.vault_id = ?1",
-            )
-            .bind(&vid)
-            .fetch_one(db.pool())
-            .await?;
+                )
+                .bind(&vid)
+                .fetch_one(db.pool())
+                .await?;
 
-            let journal = sqlx::query(
-                "SELECT state, stage, updated_at FROM ingestion_journal
+                let journal = sqlx::query(
+                    "SELECT state, stage, updated_at FROM ingestion_journal
                  WHERE vault_id = ?1
                  ORDER BY updated_at DESC
                  LIMIT 1",
-            )
-            .bind(&vid)
-            .fetch_optional(db.pool())
-            .await?;
-            if json {
-                // v0: hand-rolled JSON (no extra deps). Keep it stable.
-                let root_s = vault_root.to_string_lossy().replace('\\', "\\\\");
-                let (j_state, j_stage, j_updated_at) = if let Some(r) = &journal {
-                    (
-                        r.try_get::<String, _>("state")?,
-                        r.try_get::<String, _>("stage")?,
-                        r.try_get::<i64, _>("updated_at")?,
-                    )
+                )
+                .bind(&vid)
+                .fetch_optional(db.pool())
+                .await?;
+                if json {
+                    // v0: hand-rolled JSON (no extra deps). Keep it stable.
+                    let root_s = vault_root.to_string_lossy().replace('\\', "\\\\");
+                    let (j_state, j_stage, j_updated_at) = if let Some(r) = &journal {
+                        (
+                            r.try_get::<String, _>("state")?,
+                            r.try_get::<String, _>("stage")?,
+                            r.try_get::<i64, _>("updated_at")?,
+                        )
+                    } else {
+                        ("".to_string(), "".to_string(), 0i64)
+                    };
+
+                    println!(
+                        "{{\"vault_id\":\"{}\",\"root\":\"{}\",\"artifacts\":{},\"artifact_versions\":{},\"chunks\":{},\"journal_state\":\"{}\",\"journal_stage\":\"{}\",\"journal_updated_at\":{}}}",
+                        vid,
+                        root_s,
+                        artifacts,
+                        versions,
+                        chunks,
+                        j_state,
+                        j_stage,
+                        j_updated_at
+                    );
+                    return Ok(());
+                }
+                println!("vault_id: {}", vid);
+                println!("root: {}", vault_root.display());
+                println!("artifacts: {}", artifacts);
+                println!("artifact_versions: {}", versions);
+                println!("chunks: {}", chunks);
+
+                if let Some(r) = journal {
+                    let state: String = r.try_get("state")?;
+                    let stage: String = r.try_get("stage")?;
+                    let updated_at: i64 = r.try_get("updated_at")?;
+                    println!("journal_latest: {} / {} @ {}", state, stage, updated_at);
                 } else {
-                    ("".to_string(), "".to_string(), 0i64)
-                };
-
-                println!(
-                    "{{\"vault_id\":\"{}\",\"root\":\"{}\",\"artifacts\":{},\"artifact_versions\":{},\"chunks\":{},\"journal_state\":\"{}\",\"journal_stage\":\"{}\",\"journal_updated_at\":{}}}",
-                    vid,
-                    root_s,
-                    artifacts,
-                    versions,
-                    chunks,
-                    j_state,
-                    j_stage,
-                    j_updated_at
-                );
-                return Ok(());
+                    println!("journal_latest: (none)");
+                }
             }
-            println!("vault_id: {}", vid);
-            println!("root: {}", vault_root.display());
-            println!("artifacts: {}", artifacts);
-            println!("artifact_versions: {}", versions);
-            println!("chunks: {}", chunks);
 
-            if let Some(r) = journal {
-                let state: String = r.try_get("state")?;
-                let stage: String = r.try_get("stage")?;
-                let updated_at: i64 = r.try_get("updated_at")?;
-                println!("journal_latest: {} / {} @ {}", state, stage, updated_at);
-            } else {
-                println!("journal_latest: (none)");
-            }
-        }
-
-        Command::Search {
-            vault,
-            q,
-            limit,
-            json,
-        } => {
-            let vault_root = vault.canonicalize()?;
-            let vault_path = vault.to_string_lossy().to_string();
-            let app_root = resolve_app_root(app_root.clone())?;
+            Command::Search {
+                vault,
+                q,
+                limit,
+                json,
+            } => {
+                let vault_root = vault.canonicalize()?;
+                let vault_path = vault.to_string_lossy().to_string();
+                let app_root = resolved_app_root.clone();
 
             // Global DB for all vaults (v0): app_root\db.sqlite
             let db_path = app_root.join("db.sqlite");
@@ -1055,26 +1093,26 @@ async fn main() -> Result<()> {
                 };
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             }
-        }
-        Command::Freeze { vault, out } => {
-            let app_root = resolve_app_root(app_root.clone())?;
-            freeze_vault_with_app_root(vault, out, app_root).await?;
-        }
-        Command::Verify {
-            vault,
-            manifest,
-            json,
-        } => {
-            let app_root = resolve_app_root(app_root.clone())?;
-            verify_vault_with_app_root(vault, manifest, app_root, json).await?;
-        }
-        Command::Replay {
-            vault,
-            manifest,
-            json,
-        } => {
-            let app_root = resolve_app_root(app_root.clone())?;
-            let report = replay_validation_report(vault, manifest, app_root);
+            }
+            Command::Freeze { vault, out } => {
+                let app_root = resolved_app_root.clone();
+                freeze_vault_with_app_root(vault, out, app_root).await?;
+            }
+            Command::Verify {
+                vault,
+                manifest,
+                json,
+            } => {
+                let app_root = resolved_app_root.clone();
+                verify_vault_with_app_root(vault, manifest, app_root, json).await?;
+            }
+            Command::Replay {
+                vault,
+                manifest,
+                json,
+            } => {
+                let app_root = resolved_app_root.clone();
+                let report = replay_validation_report(vault, manifest, app_root);
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1100,17 +1138,25 @@ async fn main() -> Result<()> {
                     println!("ERR: replay validation failed");
                 }
             }
-            if !report.ok {
-                anyhow::bail!("replay failed: {} error(s)", report.errors.len());
+                if !report.ok {
+                    anyhow::bail!("replay failed: {} error(s)", report.errors.len());
+                }
+            }
+            Command::Demo { vault, json } => {
+                let app_root = resolved_app_root.clone();
+                run_demo(vault, json, app_root).await?;
             }
         }
-        Command::Demo { vault, json } => {
-            let app_root = resolve_app_root(app_root.clone())?;
-            run_demo(vault, json, app_root).await?;
-        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        print_app_root_hint_if_relevant(&e, &resolved_app_root);
+        return Err(e);
     }
 
-    Ok(())
+    result
 }
 
 #[cfg(test)]
