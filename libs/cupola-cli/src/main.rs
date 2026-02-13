@@ -1040,7 +1040,7 @@ async fn main() -> Result<()> {
                     let resp = SearchResponseDTO {
                         env: make_env(),
                         query: q.clone(),
-                        limit: limit as u32,
+                        limit,
                         hits,
                     };
                     println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -1088,7 +1088,7 @@ async fn main() -> Result<()> {
                 let resp = SearchResponseDTO {
                     env: make_env(),
                     query: q.clone(),
-                    limit: limit as u32,
+                    limit,
                     hits,
                 };
                 println!("{}", serde_json::to_string_pretty(&resp)?);
