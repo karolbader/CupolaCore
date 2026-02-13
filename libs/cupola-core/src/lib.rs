@@ -127,6 +127,8 @@ fn is_excluded(rel: &str) -> bool {
         || rel.contains("/target/")
         || rel.starts_with(".next/")
         || rel.contains("/.next/")
+        || rel.starts_with(".cupola_app/")
+        || rel.contains("/.cupola_app/")
 }
 
 fn crawl_sorted_for_verify(root: &Path) -> Result<Vec<(String, PathBuf)>> {

@@ -47,6 +47,8 @@ pub fn crawl_sorted(root: &Path) -> Result<Vec<CrawlItem>> {
             || rel.contains("/target/")
             || rel.starts_with(".next/")
             || rel.contains("/.next/")
+            || rel.starts_with(".cupola_app/")
+            || rel.contains("/.cupola_app/")
         {
             continue;
         }
