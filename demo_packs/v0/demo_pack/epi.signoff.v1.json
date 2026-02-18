@@ -1,0 +1,8 @@
+{
+  "schema_version": "epi.signoff.v1",
+  "signoff_id": "signoff-0001",
+  "decision_id": "decision-0001",
+  "reviewer": "demo.reviewer",
+  "disposition": "approved",
+  "signed_at": "2026-02-18T00:00:04Z"
+}

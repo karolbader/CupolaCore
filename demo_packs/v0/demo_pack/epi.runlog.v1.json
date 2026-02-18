@@ -1,0 +1,21 @@
+{
+  "schema_version": "epi.runlog.v1",
+  "run_id": "demo-run-0001",
+  "status": "ok",
+  "started_at": "2026-02-18T00:00:00Z",
+  "finished_at": "2026-02-18T00:00:03Z",
+  "commands": [
+    "extract",
+    "claim",
+    "decide",
+    "seal",
+    "drift"
+  ],
+  "produced_ids": {
+    "evidence_pack_id": "demo-pack-0001",
+    "claim_set_id": "claims-0001",
+    "decision_id": "decision-0001",
+    "seal_id": "seal-0001",
+    "drift_report_id": "drift-0001"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cupola.dev/contracts/v1/epi.drift_report.v1.schema.json",
+  "title": "EPI Drift Report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "epi.drift_report.v1"
+    },
+    "report_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "baseline_seal_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "current_seal_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "drift": {
+      "type": "string",
+      "enum": [
+        "none",
+        "detected"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "report_id",
+    "baseline_seal_id",
+    "current_seal_id",
+    "drift",
+    "summary"
+  ]
+}

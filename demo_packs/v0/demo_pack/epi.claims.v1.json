@@ -1,0 +1,15 @@
+{
+  "schema_version": "epi.claims.v1",
+  "claim_set_id": "claims-0001",
+  "evidence_pack_id": "demo-pack-0001",
+  "claims": [
+    {
+      "claim_id": "claim-0001",
+      "text": "The source excerpt states deterministic replay behavior.",
+      "confidence": 0.9,
+      "evidence_refs": [
+        "ext-0001"
+      ]
+    }
+  ]
+}

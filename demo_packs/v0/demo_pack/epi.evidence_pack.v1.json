@@ -1,0 +1,18 @@
+{
+  "schema_version": "epi.evidence_pack.v1",
+  "pack_id": "demo-pack-0001",
+  "run_id": "demo-run-0001",
+  "created_at": "2026-02-18T00:00:00Z",
+  "extracts": [
+    {
+      "extract_id": "ext-0001",
+      "extract_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "source": {
+        "vault_id": "vault-demo",
+        "rel_path": "docs/input.txt",
+        "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "excerpt": "Cupola uses deterministic replay for frozen inputs."
+    }
+  ]
+}

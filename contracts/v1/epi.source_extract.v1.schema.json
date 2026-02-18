@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cupola.dev/contracts/v1/epi.source_extract.v1.schema.json",
+  "title": "EPI Source Extract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "epi.source_extract.v1"
+    },
+    "extract_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "extract_hash": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "vault_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rel_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "content_hash": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "vault_id",
+        "rel_path",
+        "content_hash"
+      ]
+    },
+    "excerpt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "locator": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "start_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "start_line",
+        "end_line"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "extract_id",
+    "extract_hash",
+    "source",
+    "excerpt"
+  ]
+}

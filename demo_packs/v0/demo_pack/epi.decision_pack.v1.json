@@ -1,0 +1,10 @@
+{
+  "schema_version": "epi.decision_pack.v1",
+  "decision_id": "decision-0001",
+  "claim_set_id": "claims-0001",
+  "verdict": "allow",
+  "rationale": "The single claim is directly supported by the referenced extract.",
+  "evidence_refs": [
+    "ext-0001"
+  ]
+}

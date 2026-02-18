@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cupola.dev/contracts/v1/epi.runlog.v1.schema.json",
+  "title": "EPI Runlog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "epi.runlog.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "error"
+      ]
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "finished_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "produced_ids": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "evidence_pack_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "claim_set_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "decision_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seal_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "drift_report_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "evidence_pack_id",
+        "claim_set_id",
+        "decision_id",
+        "seal_id",
+        "drift_report_id"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "run_id",
+    "status",
+    "started_at",
+    "finished_at",
+    "commands",
+    "produced_ids"
+  ]
+}
