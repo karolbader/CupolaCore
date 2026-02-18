@@ -8,61 +8,17 @@
     "schema_version": {
       "const": "epi.claims.v1"
     },
-    "claim_set_id": {
-      "type": "string",
-      "minLength": 1
-    },
-    "evidence_pack_id": {
+    "generated_at": {
       "type": "string",
       "minLength": 1
     },
     "claims": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "$ref": "#/$defs/claim"
-      }
+      "type": "array"
     }
   },
   "required": [
     "schema_version",
-    "claim_set_id",
-    "evidence_pack_id",
+    "generated_at",
     "claims"
-  ],
-  "$defs": {
-    "claim": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "claim_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "text": {
-          "type": "string",
-          "minLength": 1
-        },
-        "confidence": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
-        },
-        "evidence_refs": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
-        }
-      },
-      "required": [
-        "claim_id",
-        "text",
-        "evidence_refs"
-      ]
-    }
-  }
+  ]
 }

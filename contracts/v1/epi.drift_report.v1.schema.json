@@ -8,36 +8,30 @@
     "schema_version": {
       "const": "epi.drift_report.v1"
     },
-    "report_id": {
+    "generated_at": {
       "type": "string",
       "minLength": 1
     },
-    "baseline_seal_id": {
+    "a_sha256": {
       "type": "string",
       "minLength": 1
     },
-    "current_seal_id": {
+    "b_sha256": {
       "type": "string",
       "minLength": 1
     },
-    "drift": {
-      "type": "string",
-      "enum": [
-        "none",
-        "detected"
-      ]
+    "changes": {
+      "type": "array"
     },
-    "summary": {
-      "type": "string",
-      "minLength": 1
+    "drift_summary": {
+      "type": "object"
     }
   },
   "required": [
     "schema_version",
-    "report_id",
-    "baseline_seal_id",
-    "current_seal_id",
-    "drift",
-    "summary"
+    "generated_at",
+    "a_sha256",
+    "b_sha256",
+    "changes"
   ]
 }

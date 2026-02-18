@@ -8,74 +8,36 @@
     "schema_version": {
       "const": "epi.runlog.v1"
     },
+    "schema": {
+      "type": "string",
+      "minLength": 1
+    },
     "run_id": {
       "type": "string",
       "minLength": 1
     },
-    "status": {
+    "created_at": {
       "type": "string",
-      "enum": [
-        "ok",
-        "error"
-      ]
+      "minLength": 1
     },
-    "started_at": {
+    "inputs": {
+      "type": "object"
+    },
+    "steps": {
+      "type": "array"
+    },
+    "stop_reason": {
       "type": "string",
-      "format": "date-time"
-    },
-    "finished_at": {
-      "type": "string",
-      "format": "date-time"
-    },
-    "commands": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "type": "string",
-        "minLength": 1
-      }
-    },
-    "produced_ids": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "evidence_pack_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "claim_set_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "decision_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "seal_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "drift_report_id": {
-          "type": "string",
-          "minLength": 1
-        }
-      },
-      "required": [
-        "evidence_pack_id",
-        "claim_set_id",
-        "decision_id",
-        "seal_id",
-        "drift_report_id"
-      ]
+      "minLength": 1
     }
   },
   "required": [
     "schema_version",
+    "schema",
     "run_id",
-    "status",
-    "started_at",
-    "finished_at",
-    "commands",
-    "produced_ids"
+    "created_at",
+    "inputs",
+    "steps",
+    "stop_reason"
   ]
 }

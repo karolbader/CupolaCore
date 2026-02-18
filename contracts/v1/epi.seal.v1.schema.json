@@ -8,41 +8,49 @@
     "schema_version": {
       "const": "epi.seal.v1"
     },
-    "seal_id": {
+    "schema": {
       "type": "string",
       "minLength": 1
-    },
-    "algorithm": {
-      "type": "string",
-      "enum": [
-        "sha256",
-        "blake3"
-      ]
-    },
-    "digest": {
-      "type": "string",
-      "minLength": 1
-    },
-    "target_ids": {
-      "type": "array",
-      "minItems": 1,
-      "uniqueItems": true,
-      "items": {
-        "type": "string",
-        "minLength": 1
-      }
     },
     "created_at": {
       "type": "string",
-      "format": "date-time"
+      "minLength": 1
+    },
+    "pack_sha256": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pack_files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "rel_path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{64}$"
+          }
+        },
+        "required": [
+          "rel_path",
+          "sha256"
+        ]
+      }
+    },
+    "replay": {
+      "type": "object"
     }
   },
   "required": [
     "schema_version",
-    "seal_id",
-    "algorithm",
-    "digest",
-    "target_ids",
-    "created_at"
+    "schema",
+    "created_at",
+    "pack_sha256",
+    "pack_files",
+    "replay"
   ]
 }
