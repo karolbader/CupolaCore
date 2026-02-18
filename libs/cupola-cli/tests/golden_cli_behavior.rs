@@ -531,3 +531,92 @@ fn demo_json_summary_passes_with_expected_steps() {
         "search_sample.rel_path missing/empty: {search_sample}"
     );
 }
+
+#[test]
+fn export_epi_writes_schema_and_keeps_hit_order_stable() {
+    let td = TempDir::new().expect("tempdir");
+    let vault = td.path().join("vault");
+    std::fs::create_dir_all(&vault).expect("vault dir");
+    std::fs::write(vault.join("a.txt"), "alpha beta gamma\n").expect("write a");
+    std::fs::write(vault.join("b.txt"), "alpha delta\n").expect("write b");
+    let appdata = td.path().join("appdata");
+    std::fs::create_dir_all(&appdata).expect("appdata dir");
+    let vault_s = vault.to_string_lossy().to_string();
+    let out_dir = td.path().join("epi_out");
+    let out_s = out_dir.to_string_lossy().to_string();
+    let out_file = out_dir.join("epi.evidence_pack.v1.json");
+    let out_file_s = out_file.to_string_lossy().to_string();
+
+    let hash = run_cli(&appdata, &["hash", "--vault", &vault_s]);
+    assert!(hash.status.success(), "hash failed: {:?}", hash);
+
+    let run1 = run_cli(
+        &appdata,
+        &[
+            "export-epi",
+            "--vault",
+            &vault_s,
+            "--out",
+            &out_s,
+            "--query",
+            "alpha",
+            "--limit",
+            "20",
+        ],
+    );
+    assert!(run1.status.success(), "export-epi run1 failed: {:?}", run1);
+    assert!(out_file.is_file(), "expected output file at {}", out_file_s);
+    let pack1: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out_file).expect("read run1 pack"))
+            .expect("parse run1 pack");
+
+    let run2 = run_cli(
+        &appdata,
+        &[
+            "export-epi",
+            "--vault",
+            &vault_s,
+            "--out",
+            &out_s,
+            "--query",
+            "alpha",
+            "--limit",
+            "20",
+        ],
+    );
+    assert!(run2.status.success(), "export-epi run2 failed: {:?}", run2);
+    let pack2: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out_file).expect("read run2 pack"))
+            .expect("parse run2 pack");
+
+    assert_eq!(
+        pack1.get("schema_version").and_then(|v| v.as_str()),
+        Some("epi.evidence_pack.v1")
+    );
+
+    let ids1: Vec<String> = pack1
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .expect("hits run1")
+        .iter()
+        .map(|h| {
+            h.get("chunk_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    let ids2: Vec<String> = pack2
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .expect("hits run2")
+        .iter()
+        .map(|h| {
+            h.get("chunk_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(ids1, ids2, "hit ordering changed between export runs");
+}

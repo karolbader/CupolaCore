@@ -11,9 +11,10 @@ use cupola_protocol::{
     VaultInfoDTO,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[derive(Parser, Debug)]
 #[command(name = "cupola", version, about = "Cupola CLI (v0)")]
 struct Cli {
@@ -72,6 +73,25 @@ enum Command {
         /// Output path for manifest JSON.
         #[arg(long)]
         out: PathBuf,
+    },
+
+    /// Export EPI evidence pack JSON into an output directory.
+    ExportEpi {
+        /// Absolute or relative path to the vault root folder.
+        #[arg(long)]
+        vault: PathBuf,
+        /// Output directory for epi.evidence_pack.v1.json.
+        #[arg(long)]
+        out: PathBuf,
+        /// Query text (default: alpha).
+        #[arg(long)]
+        query: Option<String>,
+        /// Max results (default: 20).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Optional freeze manifest JSON path.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
 
     /// Verify vault content against a manifest JSON.
@@ -251,26 +271,119 @@ fn print_search_hit(hit: &SearchHitDTO) {
     );
 }
 
-async fn freeze_vault_with_app_root(vault: PathBuf, out: PathBuf, app_root: PathBuf) -> Result<()> {
-    let vault_root = vault.canonicalize()?;
-    let db_path = app_root.join("db.sqlite");
-    let db = DbPool::new(&db_path).await?;
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
 
-    let vault_id = ensure_vault(&db, &vault_root).await?;
-    let vdir = app_root.join("vaults").join(vault_id.0.to_string());
-    let cas_root = vdir.join("cas");
-    tokio::fs::create_dir_all(&cas_root).await?;
-    let cas = CasStore::new(cas_root);
+async fn fetch_search_hit_by_chunk_id(
+    db: &DbPool,
+    vault_id: &str,
+    chunk_id: &str,
+) -> Result<Option<SearchHitDTO>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            a.rel_path as rel_path,
+            c.excerpt as excerpt,
+            c.id as chunk_id,
+            av.raw_blob_id as raw_blob_id,
+            c.chunk_blob_id as chunk_blob_id,
+            av.mtime_ns as mtime_ns,
+            av.file_type as file_type,
+            c.start_line as start_line,
+            c.end_line as end_line
+        FROM chunks c
+        JOIN artifact_versions av ON av.id = c.artifact_version_id
+        JOIN artifacts a ON a.id = av.artifact_id
+        WHERE a.vault_id = ?1 AND c.id = ?2
+        LIMIT 1
+        "#,
+    )
+    .bind(vault_id)
+    .bind(chunk_id)
+    .fetch_optional(db.pool())
+    .await?;
+    row.map(|r| row_to_search_hit(&r)).transpose()
+}
 
-    let items = cupola_indexer::crawl_sorted(&vault_root)?;
+async fn search_hits_for_vault(
+    db: &DbPool,
+    app_root: &Path,
+    vault_id: &VaultId,
+    q: &str,
+    limit: u32,
+) -> Result<(Vec<SearchHitDTO>, &'static str)> {
+    let vid = vault_id.0.to_string();
+    let index_dir = vault_indexes_root(app_root, vault_id).join("tantivy");
+
+    if index_dir.join("meta.json").is_file() {
+        let mut hits: Vec<SearchHitDTO> = Vec::new();
+        let chunk_ids = cupola_search::SearchIndex::new(&index_dir)?.search(q, limit as usize)?;
+        for chunk_id in chunk_ids {
+            if let Some(hit) = fetch_search_hit_by_chunk_id(db, &vid, &chunk_id).await? {
+                hits.push(hit);
+            }
+        }
+        return Ok((hits, "bm25"));
+    }
+
+    let like = format!("%{}%", q);
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            a.rel_path as rel_path,
+            c.excerpt as excerpt,
+            c.id as chunk_id,
+            av.raw_blob_id as raw_blob_id,
+            c.chunk_blob_id as chunk_blob_id,
+            av.mtime_ns as mtime_ns,
+            av.file_type as file_type,
+            c.start_line as start_line,
+            c.end_line as end_line
+        FROM chunks c
+        JOIN artifact_versions av ON av.id = c.artifact_version_id
+        JOIN artifacts a ON a.id = av.artifact_id
+        WHERE a.vault_id = ?1 AND c.excerpt LIKE ?2
+        ORDER BY c.created_at DESC
+        LIMIT ?3
+        "#,
+    )
+    .bind(&vid)
+    .bind(&like)
+    .bind(limit as i64)
+    .fetch_all(db.pool())
+    .await?;
+
+    let mut hits = Vec::with_capacity(rows.len());
+    for r in rows {
+        hits.push(row_to_search_hit(&r)?);
+    }
+    Ok((hits, "sqlite_like"))
+}
+
+async fn build_manifest_for_vault(
+    db: &DbPool,
+    cas: &CasStore,
+    vault_id: &VaultId,
+    vault_root: &Path,
+) -> Result<ManifestV0> {
+    let items = cupola_indexer::crawl_sorted(vault_root)?;
     let mut artifacts = Vec::with_capacity(items.len());
-
     for it in items {
         let out = cupola_indexer::stages::hash::HashStage::run(
-            &db,
-            &cas,
-            &vault_id,
-            &vault_root,
+            db,
+            cas,
+            vault_id,
+            vault_root,
             &it.abs_path,
         )
         .await?;
@@ -283,15 +396,27 @@ async fn freeze_vault_with_app_root(vault: PathBuf, out: PathBuf, app_root: Path
             artifact_version_id: out.artifact_version_id,
         });
     }
-
     artifacts.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-
-    let manifest = ManifestV0 {
+    Ok(ManifestV0 {
         vault_id: vault_id.0.to_string(),
         root: vault_root.to_string_lossy().to_string(),
         created_at: now_ns(),
         artifacts,
-    };
+    })
+}
+
+async fn freeze_vault_with_app_root(vault: PathBuf, out: PathBuf, app_root: PathBuf) -> Result<()> {
+    let vault_root = vault.canonicalize()?;
+    let db_path = app_root.join("db.sqlite");
+    let db = DbPool::new(&db_path).await?;
+
+    let vault_id = ensure_vault(&db, &vault_root).await?;
+    let vdir = app_root.join("vaults").join(vault_id.0.to_string());
+    let cas_root = vdir.join("cas");
+    tokio::fs::create_dir_all(&cas_root).await?;
+    let cas = CasStore::new(cas_root);
+
+    let manifest = build_manifest_for_vault(&db, &cas, &vault_id, &vault_root).await?;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     if let Some(parent) = out.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -321,6 +446,142 @@ async fn freeze_vault_with_app_root(vault: PathBuf, out: PathBuf, app_root: Path
         manifest.artifacts.len(),
         out.display()
     );
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct EpiQueryLogEntry {
+    query: String,
+    limit: u32,
+    timestamp: String,
+    engine: String,
+}
+
+#[derive(Serialize)]
+struct EpiSourceManifestFile {
+    rel_path: String,
+    sha256: String,
+    raw_blob_id: String,
+    mtime_ns: i64,
+    file_size: i64,
+    file_type: String,
+    artifact_version_id: String,
+}
+
+#[derive(Serialize)]
+struct EpiSourceManifest {
+    manifest_hash_sha256: String,
+    vault_id: String,
+    root: String,
+    created_at: i64,
+    files: Vec<EpiSourceManifestFile>,
+}
+
+#[derive(Serialize)]
+struct EpiEvidencePackV1 {
+    schema_version: String,
+    vault_id: String,
+    vault_snapshot_id: String,
+    query_log: Vec<EpiQueryLogEntry>,
+    hits: Vec<SearchHitDTO>,
+    source_manifest: EpiSourceManifest,
+    source_extracts: Vec<serde_json::Value>,
+}
+
+async fn export_epi_with_app_root(
+    vault: PathBuf,
+    out_dir: PathBuf,
+    query: Option<String>,
+    limit: Option<u32>,
+    manifest: Option<PathBuf>,
+    app_root: PathBuf,
+) -> Result<()> {
+    let vault_root = vault.canonicalize()?;
+    let db_path = app_root.join("db.sqlite");
+    let db = DbPool::new(&db_path).await?;
+
+    let vault_id = ensure_vault(&db, &vault_root).await?;
+    let vdir = app_root.join("vaults").join(vault_id.0.to_string());
+    let cas_root = vdir.join("cas");
+    tokio::fs::create_dir_all(&cas_root).await?;
+    let cas = CasStore::new(cas_root);
+
+    let (source_manifest_raw, source_manifest_bytes) = if let Some(path) = manifest {
+        let bytes = tokio::fs::read(path).await?;
+        let manifest_obj: ManifestV0 = serde_json::from_slice(&bytes)?;
+        (manifest_obj, bytes)
+    } else {
+        let manifest_obj = build_manifest_for_vault(&db, &cas, &vault_id, &vault_root).await?;
+        let bytes = serde_json::to_vec_pretty(&manifest_obj)?;
+        (manifest_obj, bytes)
+    };
+
+    let manifest_hash_sha256 = sha256_hex(&source_manifest_bytes);
+    let vault_snapshot_id = if manifest_hash_sha256.is_empty() {
+        "unknown".to_string()
+    } else {
+        manifest_hash_sha256.clone()
+    };
+
+    let query = query.unwrap_or_else(|| "alpha".to_string());
+    let limit = limit.unwrap_or(20);
+    let (hits, engine) = search_hits_for_vault(&db, &app_root, &vault_id, &query, limit).await?;
+
+    let manifest_vault_cas = CasStore::new(
+        app_root
+            .join("vaults")
+            .join(&source_manifest_raw.vault_id)
+            .join("cas"),
+    );
+    let mut artifacts = source_manifest_raw.artifacts.clone();
+    artifacts.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+    let mut files = Vec::with_capacity(artifacts.len());
+    for a in artifacts {
+        let sha256 = match manifest_vault_cas
+            .get(&cupola_cas::BlobId::from_hash(a.raw_blob_id.clone()))
+            .await
+        {
+            Ok(raw_bytes) => sha256_hex(&raw_bytes),
+            Err(_) => "unknown".to_string(),
+        };
+        files.push(EpiSourceManifestFile {
+            rel_path: a.rel_path,
+            sha256,
+            raw_blob_id: a.raw_blob_id,
+            mtime_ns: a.mtime_ns,
+            file_size: a.file_size,
+            file_type: a.file_type,
+            artifact_version_id: a.artifact_version_id,
+        });
+    }
+
+    let evidence_pack = EpiEvidencePackV1 {
+        schema_version: "epi.evidence_pack.v1".to_string(),
+        vault_id: source_manifest_raw.vault_id.clone(),
+        vault_snapshot_id,
+        query_log: vec![EpiQueryLogEntry {
+            query,
+            limit,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            engine: engine.to_string(),
+        }],
+        hits,
+        source_manifest: EpiSourceManifest {
+            manifest_hash_sha256,
+            vault_id: source_manifest_raw.vault_id,
+            root: source_manifest_raw.root,
+            created_at: source_manifest_raw.created_at,
+            files,
+        },
+        source_extracts: Vec::new(),
+    };
+
+    tokio::fs::create_dir_all(&out_dir).await?;
+    let out_path = out_dir.join("epi.evidence_pack.v1.json");
+    let out_bytes = serde_json::to_vec_pretty(&evidence_pack)?;
+    tokio::fs::write(&out_path, out_bytes).await?;
+    println!("OK: exported EPI evidence pack -> {}", out_path.display());
     Ok(())
 }
 
@@ -971,71 +1232,32 @@ async fn main() -> Result<()> {
                 let vault_path = vault.to_string_lossy().to_string();
                 let app_root = resolved_app_root.clone();
 
-            // Global DB for all vaults (v0): app_root\db.sqlite
-            let db_path = app_root.join("db.sqlite");
-            let db = DbPool::new(&db_path).await?;
+                // Global DB for all vaults (v0): app_root\db.sqlite
+                let db_path = app_root.join("db.sqlite");
+                let db = DbPool::new(&db_path).await?;
 
-            let vault_id = ensure_vault(&db, &vault_root).await?;
+                let vault_id = ensure_vault(&db, &vault_root).await?;
+                let (hits, _) = search_hits_for_vault(&db, &app_root, &vault_id, &q, limit).await?;
 
-            let vid = vault_id.0.to_string();
-            let index_dir = vault_indexes_root(&app_root, &vault_id).join("tantivy");
-            let mut hits: Vec<SearchHitDTO> = Vec::new();
-            let make_env = || EnvelopeDTO {
-                schema_version: "1.0.0".to_string(),
-                tool: ToolInfoDTO {
-                    name: "cupola-cli".to_string(),
-                    version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                    build: if cfg!(debug_assertions) {
-                        "debug".to_string()
-                    } else {
-                        "release".to_string()
-                    },
-                    platform: "windows-x64".to_string(),
-                },
-                generated_at: chrono::Utc::now().to_rfc3339(),
-                vault: VaultInfoDTO {
-                    vault_path: vault_path.clone(),
-                    vault_id: None,
-                },
-            };
-
-            if index_dir.join("meta.json").is_file() {
-                let chunk_ids =
-                    cupola_search::SearchIndex::new(&index_dir)?.search(&q, limit as usize)?;
-                for chunk_id in chunk_ids {
-                    let row = sqlx::query(
-                        r#"
-                        SELECT
-                            a.rel_path as rel_path,
-                            c.excerpt as excerpt,
-                            c.id as chunk_id,
-                            av.raw_blob_id as raw_blob_id,
-                            c.chunk_blob_id as chunk_blob_id,
-                            av.mtime_ns as mtime_ns,
-                            av.file_type as file_type,
-                            c.start_line as start_line,
-                            c.end_line as end_line
-                        FROM chunks c
-                        JOIN artifact_versions av ON av.id = c.artifact_version_id
-                        JOIN artifacts a ON a.id = av.artifact_id
-                        WHERE a.vault_id = ?1 AND c.id = ?2
-                        LIMIT 1
-                        "#,
-                    )
-                    .bind(&vid)
-                    .bind(&chunk_id)
-                    .fetch_optional(db.pool())
-                    .await?;
-
-                    if let Some(r) = row {
-                        let hit = row_to_search_hit(&r)?;
-                        if json {
-                            hits.push(hit);
+                let make_env = || EnvelopeDTO {
+                    schema_version: "1.0.0".to_string(),
+                    tool: ToolInfoDTO {
+                        name: "cupola-cli".to_string(),
+                        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                        build: if cfg!(debug_assertions) {
+                            "debug".to_string()
                         } else {
-                            print_search_hit(&hit);
-                        }
-                    }
-                }
+                            "release".to_string()
+                        },
+                        platform: "windows-x64".to_string(),
+                    },
+                    generated_at: chrono::Utc::now().to_rfc3339(),
+                    vault: VaultInfoDTO {
+                        vault_path: vault_path.clone(),
+                        vault_id: None,
+                    },
+                };
+
                 if json {
                     let resp = SearchResponseDTO {
                         env: make_env(),
@@ -1044,59 +1266,25 @@ async fn main() -> Result<()> {
                         hits,
                     };
                     println!("{}", serde_json::to_string_pretty(&resp)?);
-                }
-                return Ok(());
-            }
-
-            let like = format!("%{}%", q);
-
-            let rows = sqlx::query(
-                r#"
-                SELECT
-                    a.rel_path as rel_path,
-                    c.excerpt as excerpt,
-                    c.id as chunk_id,
-                    av.raw_blob_id as raw_blob_id,
-                    c.chunk_blob_id as chunk_blob_id,
-                    av.mtime_ns as mtime_ns,
-                    av.file_type as file_type,
-                    c.start_line as start_line,
-                    c.end_line as end_line
-                FROM chunks c
-                JOIN artifact_versions av ON av.id = c.artifact_version_id
-                JOIN artifacts a ON a.id = av.artifact_id
-                WHERE a.vault_id = ?1 AND c.excerpt LIKE ?2
-                ORDER BY c.created_at DESC
-                LIMIT ?3
-                "#,
-            )
-            .bind(vid)
-            .bind(&like)
-            .bind(limit as i64)
-            .fetch_all(db.pool())
-            .await?;
-
-            for r in rows {
-                let hit = row_to_search_hit(&r)?;
-                if json {
-                    hits.push(hit);
                 } else {
-                    print_search_hit(&hit);
+                    for hit in &hits {
+                        print_search_hit(hit);
+                    }
                 }
-            }
-            if json {
-                let resp = SearchResponseDTO {
-                    env: make_env(),
-                    query: q.clone(),
-                    limit,
-                    hits,
-                };
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            }
             }
             Command::Freeze { vault, out } => {
                 let app_root = resolved_app_root.clone();
                 freeze_vault_with_app_root(vault, out, app_root).await?;
+            }
+            Command::ExportEpi {
+                vault,
+                out,
+                query,
+                limit,
+                manifest,
+            } => {
+                let app_root = resolved_app_root.clone();
+                export_epi_with_app_root(vault, out, query, limit, manifest, app_root).await?;
             }
             Command::Verify {
                 vault,
