@@ -7,6 +7,7 @@ members = [
   "libs/cupola-protocol",
   "libs/cupola-cli",
   "libs/cupola-search",
+  "libs/epi-cli",
 ]
 
 [workspace.package]
