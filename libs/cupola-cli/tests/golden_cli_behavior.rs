@@ -4,8 +4,29 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
 
-fn bin_path() -> &'static str {
-    env!("CARGO_BIN_EXE_cupola-cli")
+fn bin_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_cupola-cli")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_cupola_cli"))
+    {
+        return PathBuf::from(path);
+    }
+
+    let exe_name = if cfg!(windows) {
+        "cupola-cli.exe"
+    } else {
+        "cupola-cli"
+    };
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(profile_dir) = current_exe.parent().and_then(|deps| deps.parent()) {
+            let candidate = profile_dir.join(exe_name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    panic!("failed to resolve cupola-cli binary path")
 }
 
 fn run_cli(appdata: &Path, args: &[&str]) -> Output {
